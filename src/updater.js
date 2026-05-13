@@ -442,7 +442,7 @@ function initUpdater(ctx, deps = {}) {
     return true;
   }
 
-  async function runGitUpdate(repoRoot, branch, localHead) {
+  async function runGitUpdate(repoRoot, branch, localHead, remoteName = "origin") {
     updateStatus = "downloading";
     setOverlay("downloading");
     rebuildMenus();
@@ -453,7 +453,7 @@ function initUpdater(ctx, deps = {}) {
     );
 
     try {
-      await gitCmd(["pull", "origin", branch], repoRoot, 60000);
+      await gitCmd(["pull", remoteName, branch], repoRoot, 60000);
     } catch (err) {
       err.updateOperation = "Apply Git Update";
       err.updateFailureType = "Git Pull Failed";
@@ -503,8 +503,25 @@ function initUpdater(ctx, deps = {}) {
       const branch = await gitCmd(["rev-parse", "--abbrev-ref", "HEAD"], repoRoot);
       await gitCmd(["fetch", "origin", branch], repoRoot);
 
+      // Try upstream remote too (fork sync scenario)
+      let hasUpstream = false;
+      try {
+        await gitCmd(["fetch", "upstream", branch], repoRoot);
+        hasUpstream = true;
+      } catch {}
+
       const localHead = await gitCmd(["rev-parse", "HEAD"], repoRoot);
-      const remoteHead = await gitCmd(["rev-parse", `origin/${branch}`], repoRoot);
+      let remoteName = "origin";
+      let remoteHead = await gitCmd(["rev-parse", `origin/${branch}`], repoRoot);
+
+      // If upstream exists and is further ahead, use it instead
+      if (hasUpstream) {
+        const upstreamHead = await gitCmd(["rev-parse", `upstream/${branch}`], repoRoot);
+        if (upstreamHead !== localHead) {
+          remoteName = "upstream";
+          remoteHead = upstreamHead;
+        }
+      }
 
       if (localHead === remoteHead) {
         updateStatus = "idle";
@@ -517,7 +534,7 @@ function initUpdater(ctx, deps = {}) {
 
       let remoteVersion;
       try {
-        const remotePkg = await gitCmd(["show", `origin/${branch}:package.json`], repoRoot);
+        const remotePkg = await gitCmd(["show", `${remoteName}/${branch}:package.json`], repoRoot);
         remoteVersion = JSON.parse(remotePkg).version;
       } catch {
         remoteVersion = remoteHead.slice(0, 8);
@@ -555,7 +572,7 @@ function initUpdater(ctx, deps = {}) {
             });
             return;
           }
-          await runGitUpdate(repoRoot, branch, localHead);
+          await runGitUpdate(repoRoot, branch, localHead, remoteName);
         },
       });
     } catch (err) {
