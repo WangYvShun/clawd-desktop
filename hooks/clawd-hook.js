@@ -193,6 +193,42 @@ function buildStateBody(event, payload, resolve) {
     if (pidChain.length) body.pid_chain = pidChain;
   }
 
+  // ── Task progress ────────────────────────────────────────────
+  // Read Claude Code task files to show step progress in Clawd HUD
+  try {
+    const tasksDir = path.join(os.homedir(), ".claude", "tasks");
+    if (fs.existsSync(tasksDir)) {
+      const sessions = fs.readdirSync(tasksDir, { withFileTypes: true })
+        .filter(e => e.isDirectory())
+        .map(e => e.name)
+        .sort().reverse();
+
+      let allTasks = [];
+      for (const sid of sessions) {
+        const dir = path.join(tasksDir, sid);
+        if (!fs.statSync(dir).isDirectory()) continue;
+        const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
+        for (const f of files) {
+          try {
+            const data = JSON.parse(fs.readFileSync(path.join(dir, f), "utf-8"));
+            if (data && data.status) allTasks.push(data);
+          } catch {}
+        }
+      }
+
+      const total = allTasks.length;
+      const done = allTasks.filter(t => t.status === "completed").length;
+      const current = allTasks.find(t => t.status === "in_progress") || null;
+
+      if (current) {
+        body.task_name = (current.subject || "").slice(0, 30);
+      }
+      if (total > 0) {
+        body.task_step = `${done}/${total}`;
+        body.task_progress = total > 0 ? Math.round((done / total) * 100) : 0;
+      }
+    }
+  } catch {}
   return body;
 }
 
