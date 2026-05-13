@@ -719,6 +719,9 @@ function updateSession(sessionId, state, event, opts = {}) {
     provider = null,
     displayHint = undefined,
     sessionTitle = null,
+    taskName = null,
+    taskStep = null,
+    taskProgress = null,
     permissionSuspect = false,
     preserveState = false,
     hookSource = null,
@@ -764,6 +767,9 @@ function updateSession(sessionId, state, event, opts = {}) {
   // Sticky: empty input does not clear an existing title. A session that has
   // ever been named keeps that name until the user explicitly renames it.
   const srcSessionTitle = normalizeTitle(sessionTitle) || (existing && existing.sessionTitle) || null;
+  const srcTaskName = taskName || (existing && existing.taskName) || null;
+  const srcTaskStep = taskStep || (existing && existing.taskStep) || null;
+  const srcTaskProgress = taskProgress != null ? taskProgress : (existing && existing.taskProgress) || null;
   const srcResumeState = (existing && existing.resumeState) || null;
   const isSubagentStart = event === "SubagentStart" || event === "subagentStart";
   const isSubagentStop = event === "SubagentStop" || event === "subagentStop";
@@ -774,7 +780,7 @@ function updateSession(sessionId, state, event, opts = {}) {
   const pidReachable = resolvePidReachable(existing, srcAgentPid, srcPid);
 
   const recentEvents = pushRecentEvent(existing, preservedState || state, event);
-  const base = { sourcePid: srcPid, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, sessionTitle: srcSessionTitle, recentEvents, pidReachable };
+  const base = { sourcePid: srcPid, cwd: srcCwd, editor: srcEditor, pidChain: srcPidChain, agentPid: srcAgentPid, agentId: srcAgentId, host: srcHost, headless: srcHeadless, platform: srcPlatform, model: srcModel, provider: srcProvider, sessionTitle: srcSessionTitle, taskName: srcTaskName, taskStep: srcTaskStep, taskProgress: srcTaskProgress, recentEvents, pidReachable };
 
   // Evict oldest session if at capacity and this is a new session
   if (!existing && sessions.size >= MAX_SESSIONS) {

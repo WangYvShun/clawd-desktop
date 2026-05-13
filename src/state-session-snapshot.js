@@ -154,6 +154,9 @@ function buildSessionSnapshotEntry(id, session, sessionAliases = {}, options = {
     platform: (session && session.platform) || null,
     model: (session && session.model) || null,
     provider: (session && session.provider) || null,
+    taskName: (session && session.taskName) || null,
+    taskStep: (session && session.taskStep) || null,
+    taskProgress: (session && session.taskProgress) || null,
     lastEvent: latestEvent ? {
       labelKey: rawEvent ? (EVENT_LABEL_KEYS[rawEvent] || null) : null,
       rawEvent,

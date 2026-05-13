@@ -105,6 +105,16 @@ function createRowForSession(session, now) {
   title.textContent = titleFor(session);
   left.appendChild(title);
 
+  // Task progress label
+  if (session.taskName) {
+    const taskEl = document.createElement("span");
+    taskEl.className = "task-info";
+    let text = session.taskName;
+    if (session.taskStep) text += `  ${session.taskStep}`;
+    taskEl.textContent = text;
+    left.appendChild(taskEl);
+  }
+
   const showElapsed = snapshot.hudShowElapsed !== false;
   const right = document.createElement("span");
   right.className = "right";

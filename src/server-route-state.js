@@ -86,6 +86,9 @@ function handleStatePost(req, res, options) {
       // "ignore + fall back" pattern used by cwd / agent_id above.
       const rawTitle = typeof data.session_title === "string" ? data.session_title.trim() : "";
       const sessionTitle = rawTitle || null;
+      const taskName = typeof data.task_name === "string" ? data.task_name.trim() : null;
+      const taskStep = typeof data.task_step === "string" ? data.task_step.trim() : null;
+      const taskProgress = Number.isFinite(data.task_progress) ? data.task_progress : null;
       const permissionSuspect = data.permission_suspect === true;
       const preserveState = data.preserve_state === true;
       const hookSource = typeof data.hook_source === "string" ? data.hook_source : null;
@@ -158,6 +161,9 @@ function handleStatePost(req, res, options) {
             provider,
             displayHint: display_svg,
             sessionTitle,
+            taskName,
+            taskStep,
+            taskProgress,
             permissionSuspect,
             preserveState,
             hookSource,
