@@ -501,21 +501,81 @@ function initUpdater(ctx, deps = {}) {
 
     try {
       const branch = await gitCmd(["rev-parse", "--abbrev-ref", "HEAD"], repoRoot);
-      await gitCmd(["fetch", "origin", branch], repoRoot);
 
-      // Try upstream remote too (fork sync scenario)
-      let hasUpstream = false;
+      // Fetch from origin, tolerate failure (China GitHub block)
+      let originFetched = false;
+      try {
+        await gitCmd(["fetch", "origin", branch], repoRoot);
+        originFetched = true;
+      } catch (err) {
+        log(`Warn: git fetch origin failed: ${err.message}`);
+      }
+
+      // Try upstream too, tolerate failure
+      let upstreamFetched = false;
       try {
         await gitCmd(["fetch", "upstream", branch], repoRoot);
-        hasUpstream = true;
-      } catch {}
+        upstreamFetched = true;
+      } catch (err) {
+        log(`Warn: git fetch upstream failed: ${err.message}`);
+      }
+
+      // Both fetches failed -> try GitHub API fallback
+      if (!originFetched && !upstreamFetched) {
+        try {
+          const release = await fetchLatestRelease();
+          const rv = release.tag_name;
+          if (compareVersions(app.getVersion(), rv) < 0) {
+            updateStatus = "available";
+            manualUpdateCheck = false;
+            setOverlay("available");
+            rebuildMenus();
+            const action = await showBubble({
+              mode: "available",
+              title: t("updateAvailable", "Update Available"),
+              message: t("updateAvailableMsg", "v{version} is available. Open download page?").replace("{version}", formatVersionForMessage(rv)),
+              version: rv,
+              actions: [
+                { id: "primary", label: t("download", "Download"), variant: "primary" },
+                { id: "later", label: t("restartLater", "Later"), variant: "secondary" },
+              ],
+              defaultAction: "later",
+              lang: ctx.lang || "en",
+              requireAction: true,
+            });
+            if (action === "primary") shell.openExternal(RELEASES_LATEST_URL);
+            hideBubble();
+            dismissToResolvedState();
+            updateStatus = "idle";
+            manualUpdateCheck = false;
+            rebuildMenus();
+            return;
+          }
+        } catch {}
+        updateStatus = "error";
+        manualUpdateCheck = false;
+        rebuildMenus();
+        clearOverlay();
+        if (manual) {
+          await showErrorBubble({
+            failureType: "Network Error",
+            operation: "Check for Updates",
+            reason: "Cannot connect to GitHub. Check network or proxy.",
+            nextStep: "Try later, or visit github.com/rullerzhou-afk/clawd-on-desk/releases",
+            detail: "Git fetch and GitHub API both unreachable.",
+          });
+        }
+        return;
+      }
 
       const localHead = await gitCmd(["rev-parse", "HEAD"], repoRoot);
       let remoteName = "origin";
-      let remoteHead = await gitCmd(["rev-parse", `origin/${branch}`], repoRoot);
+      let remoteHead = originFetched
+        ? await gitCmd(["rev-parse", `origin/${branch}`], repoRoot)
+        : localHead;
 
-      // If upstream exists and is further ahead, use it instead
-      if (hasUpstream) {
+      // If upstream is further ahead, use it
+      if (upstreamFetched) {
         const upstreamHead = await gitCmd(["rev-parse", `upstream/${branch}`], repoRoot);
         if (upstreamHead !== localHead) {
           remoteName = "upstream";
