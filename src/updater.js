@@ -523,21 +523,23 @@ function initUpdater(ctx, deps = {}) {
         }
       }
 
-      if (localHead === remoteHead) {
+      let remoteVersion;
+      try {
+        const remotePkg = await gitCmd(["show", `${remoteName}/${branch}:package.json`], repoRoot);
+        remoteVersion = JSON.parse(remotePkg).version;
+      } catch {
+        remoteVersion = null;
+      }
+
+      // Up to date if: same commit hash, OR same/newer version (local-only commits)
+      const sameVersion = remoteVersion && compareVersions(app.getVersion(), remoteVersion) >= 0;
+      if (localHead === remoteHead || sameVersion) {
         updateStatus = "idle";
         manualUpdateCheck = false;
         rebuildMenus();
         if (manual) await showUpToDateBubble(app.getVersion());
         else dismissToResolvedState();
         return;
-      }
-
-      let remoteVersion;
-      try {
-        const remotePkg = await gitCmd(["show", `${remoteName}/${branch}:package.json`], repoRoot);
-        remoteVersion = JSON.parse(remotePkg).version;
-      } catch {
-        remoteVersion = remoteHead.slice(0, 8);
       }
 
       if (!manual && isSilentMode()) {
@@ -554,7 +556,7 @@ function initUpdater(ctx, deps = {}) {
 
       await promptAvailableUpdate({
         mode: "git",
-        version: remoteVersion,
+        version: remoteVersion || remoteHead.slice(0, 8),
         onPrimary: async () => {
           const dirty = await gitCmd(["status", "--porcelain"], repoRoot);
           if (dirty) {
