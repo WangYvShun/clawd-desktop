@@ -23,6 +23,14 @@ const { normalizeShortcuts, getDefaultShortcuts } = require("./shortcut-actions"
 const { isValidDisplaySnapshot } = require("./work-area");
 const { normalizeRemoteSsh, getDefaults: getRemoteSshDefaults } = require("./remote-ssh-profile");
 const {
+  cloneDefaultTelegramApproval,
+  normalizeTelegramApproval,
+} = require("./telegram-approval-settings");
+const {
+  DEFAULT_HARDWARE_BUDDY_SETTINGS,
+  normalizeHardwareBuddySettings,
+} = require("./hardware-buddy-settings");
+const {
   NOTIFICATION_DEFAULT_SECONDS,
   UPDATE_DEFAULT_SECONDS,
   PERMISSION_DEFAULT_SECONDS,
@@ -137,6 +145,11 @@ const SCHEMA = {
       "copilot-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "cursor-agent": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "gemini-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
+      // Antigravity is state-only post-D2 — Clawd never surfaces a permission
+      // bubble for agy regardless of this flag (see server-route-permission.js
+      // antigravity branch). Default kept as false so legacy reads don't see a
+      // stale "true" implying bubbles are enabled.
+      "antigravity-cli": { enabled: true, permissionsEnabled: false },
       "codebuddy": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "kiro-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
       "kimi-cli": { enabled: true, permissionsEnabled: true, notificationHookEnabled: true },
@@ -172,6 +185,16 @@ const SCHEMA = {
     type: "object",
     defaultFactory: () => getRemoteSshDefaults(),
     normalize: normalizeRemoteSsh,
+  },
+  tgApproval: {
+    type: "object",
+    defaultFactory: () => cloneDefaultTelegramApproval(),
+    normalize: normalizeTelegramApproval,
+  },
+  hardwareBuddy: {
+    type: "object",
+    defaultFactory: () => ({ ...DEFAULT_HARDWARE_BUDDY_SETTINGS }),
+    normalize: normalizeHardwareBuddySettings,
   },
 };
 

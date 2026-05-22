@@ -31,6 +31,7 @@ describe("prefs.getDefaults", () => {
     assert.notStrictEqual(a.themeOverrides, b.themeOverrides);
     assert.notStrictEqual(a.shortcuts, b.shortcuts);
     assert.notStrictEqual(a.sessionAliases, b.sessionAliases);
+    assert.notStrictEqual(a.tgApproval, b.tgApproval);
     // Mutating one shouldn't affect the other
     a.agents["claude-code"].enabled = false;
     assert.strictEqual(b.agents["claude-code"].enabled, true);
@@ -59,17 +60,23 @@ describe("prefs.getDefaults", () => {
     assert.strictEqual(d.notificationBubbleAutoCloseSeconds, 6);
     assert.strictEqual(d.updateBubbleAutoCloseSeconds, 9);
     assert.deepStrictEqual(d.sessionAliases, {});
+    assert.deepStrictEqual(d.tgApproval, {
+      enabled: false,
+      allowedTgUserId: "",
+      targetSessionKey: "",
+    });
   });
 
   it("seeds all known agents as enabled", () => {
     const d = prefs.getDefaults();
-    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "kimi-cli", "opencode", "pi", "openclaw", "hermes"]) {
+    for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "antigravity-cli", "codebuddy", "kiro-cli", "kimi-cli", "opencode", "pi", "openclaw", "hermes"]) {
       assert.strictEqual(d.agents[id].enabled, true, `${id} should default enabled`);
     }
   });
 
   it("seeds permission-capable agents with permissionsEnabled=true", () => {
     const d = prefs.getDefaults();
+    // Antigravity intentionally excluded — D2 makes it state-only, no bubble.
     for (const id of ["claude-code", "codex", "copilot-cli", "cursor-agent", "gemini-cli", "codebuddy", "kiro-cli", "kimi-cli", "opencode", "pi"]) {
       assert.strictEqual(
         d.agents[id].permissionsEnabled,
@@ -77,6 +84,11 @@ describe("prefs.getDefaults", () => {
         `${id} should default permissionsEnabled`
       );
     }
+    assert.strictEqual(
+      d.agents["antigravity-cli"].permissionsEnabled,
+      false,
+      "antigravity-cli is state-only (D2), permissionsEnabled must default to false"
+    );
     assert.strictEqual(
       Object.prototype.hasOwnProperty.call(d.agents.hermes, "permissionsEnabled"),
       false,
@@ -101,6 +113,17 @@ describe("prefs.getDefaults", () => {
   it("defaults Codex permissions to intercept mode", () => {
     const d = prefs.getDefaults();
     assert.strictEqual(d.agents.codex.permissionMode, "intercept");
+  });
+
+  it("defaults Hardware Buddy to disabled state-only BLE", () => {
+    const d = prefs.getDefaults();
+    assert.deepStrictEqual(d.hardwareBuddy, {
+      enabled: false,
+      backend: "bleak",
+      address: "",
+      namePrefix: "Clawstick",
+      permissionsEnabled: false,
+    });
   });
 });
 
@@ -217,6 +240,23 @@ describe("prefs.validate", () => {
     assert.strictEqual(v.agents.pi.permissionsEnabled, true);
   });
 
+  it("normalizes Telegram approval prefs without storing a token", () => {
+    const v = prefs.validate({
+      tgApproval: {
+        enabled: true,
+        allowedTgUserId: " 123456789 ",
+        targetSessionKey: "987654321",
+        botToken: "123:should-not-survive",
+      },
+    });
+    assert.deepStrictEqual(v.tgApproval, {
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:987654321",
+    });
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(v.tgApproval, "botToken"), false);
+  });
+
   it("keeps valid fields verbatim", () => {
     const v = prefs.validate({
       lang: "ko",
@@ -319,6 +359,15 @@ describe("prefs.validate", () => {
     assert.deepStrictEqual(v.agents.hermes, { enabled: true });
   });
 
+  it("normalizes agents: preserves Antigravity permission flag but strips notification flag", () => {
+    const v = prefs.validate({
+      agents: {
+        "antigravity-cli": { enabled: false, permissionsEnabled: false, notificationHookEnabled: true },
+      },
+    });
+    assert.deepStrictEqual(v.agents["antigravity-cli"], { enabled: false, permissionsEnabled: false });
+  });
+
   it("normalizes agents: preserves notificationHookEnabled flag", () => {
     const v = prefs.validate({
       agents: {
@@ -373,6 +422,11 @@ describe("prefs.validate", () => {
       Object.prototype.hasOwnProperty.call(d.agents.hermes, "notificationHookEnabled"),
       false,
       "hermes should not expose a dead notificationHookEnabled switch"
+    );
+    assert.strictEqual(
+      Object.prototype.hasOwnProperty.call(d.agents["antigravity-cli"], "notificationHookEnabled"),
+      false,
+      "antigravity-cli should not expose a dead notificationHookEnabled switch"
     );
   });
 
@@ -525,6 +579,26 @@ describe("prefs.validate", () => {
       permissionAllow: "CommandOrControl+Shift+Y",
       permissionDeny: "CommandOrControl+Shift+N",
     });
+  });
+
+  it("normalizes Hardware Buddy settings", () => {
+    const v = prefs.validate({
+      hardwareBuddy: {
+        enabled: true,
+        backend: "fake",
+        address: "  FAKE:CLAWSTICK  ",
+        namePrefix: "  Claude  ",
+        permissionsEnabled: true,
+      },
+    });
+    assert.deepStrictEqual(v.hardwareBuddy, {
+      enabled: true,
+      backend: "fake",
+      address: "FAKE:CLAWSTICK",
+      namePrefix: "Claude",
+      permissionsEnabled: true,
+    });
+    assert.deepStrictEqual(prefs.validate({ hardwareBuddy: "bad" }).hardwareBuddy, prefs.getDefaults().hardwareBuddy);
   });
 });
 

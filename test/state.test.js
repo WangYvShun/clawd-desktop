@@ -71,6 +71,7 @@ function update(api, o = {}) {
     o.event || "PreToolUse",
     {
       sourcePid: o.sourcePid ?? null,
+      wtHwnd: o.wtHwnd ?? null,
       cwd: o.cwd || "/tmp",
       editor: o.editor || null,
       pidChain: o.pidChain || null,
@@ -96,6 +97,7 @@ function rawSession(state, opts = {}) {
     updatedAt: opts.updatedAt ?? Date.now(),
     displayHint: opts.displayHint || null,
     sourcePid: opts.sourcePid || null,
+    wtHwnd: opts.wtHwnd || null,
     cwd: opts.cwd || "",
     editor: opts.editor || null,
     pidChain: opts.pidChain || null,
@@ -357,10 +359,10 @@ describe("working sub-animations", () => {
     assert.strictEqual(api.getSvgOverride("working"), "clawd-working-typing.svg");
   });
 
-  it("2 working sessions → juggling SVG", () => {
+  it("2 working sessions → headphones groove SVG", () => {
     api.sessions.set("s1", rawSession("working"));
     api.sessions.set("s2", rawSession("working"));
-    assert.strictEqual(api.getSvgOverride("working"), "clawd-working-juggling.svg");
+    assert.strictEqual(api.getSvgOverride("working"), "clawd-headphones-groove.svg");
   });
 
   it("3+ working sessions → building SVG", () => {
@@ -891,6 +893,27 @@ describe("updateSession()", () => {
       type: "codex-thread",
       url: "codex://threads/019e115a-4df2-7ed0-b90e-8e6345aca777",
     });
+  });
+
+  it("keeps wtHwnd sticky when later events do not provide one", () => {
+    update(api, {
+      id: "s1",
+      state: "idle",
+      event: "SessionStart",
+      sourcePid: 100,
+      wtHwnd: "123456",
+    });
+    update(api, {
+      id: "s1",
+      state: "working",
+      event: "PostToolUse",
+      sourcePid: 100,
+    });
+
+    const session = api.sessions.get("s1");
+    assert.strictEqual(session.wtHwnd, "123456");
+    const entry = api.getLastSessionSnapshot().sessions.find((item) => item.id === "s1");
+    assert.strictEqual(entry.wtHwnd, "123456");
   });
 
   it("Codex PermissionRequest focus metadata respects the session cap", () => {
