@@ -37,9 +37,31 @@ const {
   clearCachedRemoteNodeBin,
   buildRemoteNodeEvalCommand,
 } = require("./remote-ssh-node");
+const { decodeShellBytes } = require("./remote-ssh-decode");
 
 const SSH_BASE_OPTS = ["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"];
 const SCP_BASE_OPTS = ["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"];
+// Interactive base intentionally empty: no -T (pty needed), no BatchMode=yes
+// (must allow password / passphrase / host-key prompts), no ConnectTimeout=15
+// (user-initiated; they can wait). Callers add `-o BatchMode=no` via extraOpts
+// to also beat any `BatchMode yes` in the user's ~/.ssh/config — command-line
+// -o wins because it's the FIRST BatchMode token ssh sees.
+const SSH_INTERACTIVE_BASE_OPTS = [];
+
+// "cmd is not recognized" — emitted by Windows OpenSSH when the remote
+// default shell is cmd.exe and our `sh -c <script>` probe lands on it.
+// Multi-language because the Windows console respects the user locale
+// (zh-CN/zh-TW/ja/ko/de). When the resolver fails with this pattern we
+// know the host is windows-cmd and there's no point retrying the resolver
+// or logging the same expected failure on every reconnect — the bare
+// `node` health probe already keeps the tunnel green on Windows hosts
+// that happen to have node.exe on PATH.
+const WINDOWS_CMD_STDERR_RX =
+  /not recognized as an internal or external command|不是内部或外部命令|不是內部或外部命令|内部コマンドまたは外部コマンド|내부 명령 또는 외부 명령|nicht als interner oder externer/i;
+
+function looksLikeWindowsCmdStderr(stderr) {
+  return WINDOWS_CMD_STDERR_RX.test(String(stderr || ""));
+}
 
 const PROBE_WINDOW_MS = 12000;
 const PROBE_MIN_GAP_MS = 250;
@@ -119,12 +141,22 @@ function detectSsh({ spawnSync = childProcess.spawnSync } = {}) {
 // authenticate, and open-terminal paths MUST go through these. They guarantee:
 //
 //   1. Non-interactive defaults (-T, BatchMode=yes, ConnectTimeout=15) so
-//      the spawned process never wedges on a prompt.
+//      backgrounded tunnels / probes / deploys never wedge on a prompt.
 //   2. Profile's `-i identityFile` / `-p port` (scp: `-P port`) are always
 //      injected, so non-default-port / specified-key profiles work for
 //      Deploy, Codex monitor, Authenticate — not just Connect.
-//   3. extraOpts append AFTER profile defaults so `-o BatchMode=no` and
-//      `-o ConnectTimeout=2` overrides can win via ssh's last-wins semantics.
+//   3. Interactive callers (`interactive: true`) get an empty base via
+//      `SSH_INTERACTIVE_BASE_OPTS`, since `-T` breaks remote pty, and
+//      `BatchMode=yes` would suppress the very prompts (password,
+//      passphrase, host-key confirm) the user opened the terminal to answer.
+//
+// FIRST-WINS, NOT LAST-WINS. ssh_config(5): "For each parameter, the first
+// obtained value will be used." This applies to command-line `-o` too:
+// `-o BatchMode=yes -o BatchMode=no` resolves to BatchMode=yes, not no
+// (verified with `ssh -G` on OpenSSH 9.5p2 / 10.0p2). Consequence: a future
+// `extraOpts` `-o Foo=bar` only wins if Foo is NOT already in the base opt
+// list. If you need to override a base opt, change the base or add a
+// separate base array — appending in extraOpts is a no-op.
 //
 // Host is appended last for ssh; scp callers add `host:path` themselves.
 function buildSshArgs(profile, { extraOpts = [], interactive = false } = {}) {
@@ -134,15 +166,9 @@ function buildSshArgs(profile, { extraOpts = [], interactive = false } = {}) {
   if (!Array.isArray(extraOpts)) {
     throw new TypeError("buildSshArgs: extraOpts must be an array");
   }
-  // `-T` (no pseudo-tty) is correct for backgrounded tunnels, deploys, and
-  // probes — but **wrong** for Authenticate / Open Terminal: those land the
-  // user in an interactive shell, where -T breaks vim/less/bash readline.
-  // Caller passes interactive: true to drop -T, letting ssh negotiate a pty
-  // by default (terminal emulator already provides a local tty).
-  const baseOpts = interactive
-    ? SSH_BASE_OPTS.filter((opt) => opt !== "-T")
+  const args = interactive
+    ? SSH_INTERACTIVE_BASE_OPTS.slice()
     : SSH_BASE_OPTS.slice();
-  const args = baseOpts;
   if (profile.identityFile) args.push("-i", profile.identityFile);
   if (profile.port && profile.port !== 22) args.push("-p", String(profile.port));
   args.push(...extraOpts);
@@ -305,7 +331,9 @@ function createRemoteSshRuntime(deps = {}) {
       lastError: null,
       lastErrorReason: null,
       sshChild: null,
-      stderrBuf: "",
+      // Accumulated raw stderr bytes — decoded once on read so a GBK/CP936
+      // remote (Windows cmd, zh-locale Linux) doesn't show up as mojibake.
+      stderrBuf: Buffer.alloc(0),
       probeChild: null,
       probeInFlight: false,
       probeStartedAt: 0,
@@ -317,6 +345,13 @@ function createRemoteSshRuntime(deps = {}) {
       remoteNodeSource: null,
       allowBareNodeProbe: false,
       remoteNodeResolveInFlight: false,
+      // Set to "windows-cmd" the first time the resolver fails with the
+      // "is not recognized" stderr pattern. Acts as a one-shot negative
+      // cache for the background resolver and any future resolver retry
+      // call site, so we don't spam the user with the same expected
+      // failure every time the tunnel reconnects.
+      remoteShell: null,
+      remoteShellTarget: null,
       backoffTimer: null,
       retryAttempt: 0,
       unknownStrikes: 0,
@@ -367,8 +402,12 @@ function createRemoteSshRuntime(deps = {}) {
     if (!profile || !profile.id) throw new Error("connect: profile.id required");
     let state = states.get(profile.id);
     if (state) {
+      const targetChanged = remoteShellCacheKey(state.profile) !== remoteShellCacheKey(profile);
       // Replace profile snapshot — caller may have just edited fields.
       state.profile = profile;
+      if (targetChanged) {
+        clearRemoteShellCache(state);
+      }
       // If already connecting / connected, no-op (idempotent).
       if (state.status === "connecting" || state.status === "connected"
           || state.status === "reconnecting") {
@@ -378,6 +417,7 @@ function createRemoteSshRuntime(deps = {}) {
       state.retryAttempt = 0;
       state.unknownStrikes = 0;
       state.stopped = false;
+      clearRemoteShellCache(state);
     } else {
       state = newState(profile);
       states.set(profile.id, state);
@@ -457,7 +497,7 @@ function createRemoteSshRuntime(deps = {}) {
     }
 
     state.sshChild = child;
-    state.stderrBuf = "";
+    state.stderrBuf = Buffer.alloc(0);
 
     // All handlers below identity-gate against `child` (closure-captured) so
     // a stale exit/error from a previous Disconnect→Connect cycle can't
@@ -482,7 +522,10 @@ function createRemoteSshRuntime(deps = {}) {
     if (child.stderr) {
       child.stderr.on("data", (chunk) => {
         if (state.sshChild !== child) return;
-        state.stderrBuf += chunk.toString();
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+        state.stderrBuf = state.stderrBuf.length === 0
+          ? buf
+          : Buffer.concat([state.stderrBuf, buf]);
         // Cap buffer at 8KB to avoid unbounded growth on noisy hosts.
         if (state.stderrBuf.length > 8192) {
           state.stderrBuf = state.stderrBuf.slice(-8192);
@@ -505,6 +548,25 @@ function createRemoteSshRuntime(deps = {}) {
       remoteForwardPort: profile && profile.remoteForwardPort,
       hostPrefix: profile && profile.hostPrefix,
     };
+  }
+
+  function remoteShellCacheKey(profile) {
+    return JSON.stringify({
+      host: profile && profile.host || "",
+      port: Number.isInteger(profile && profile.port) ? profile.port : 22,
+      identityFile: profile && profile.identityFile || "",
+    });
+  }
+
+  function clearRemoteShellCache(state) {
+    if (!state) return;
+    state.remoteShell = null;
+    state.remoteShellTarget = null;
+  }
+
+  function markRemoteShell(state, shell, target) {
+    state.remoteShell = shell;
+    state.remoteShellTarget = target || remoteShellCacheKey(state.profile);
   }
 
   function startProbeLoopWithRemoteNode(state, child) {
@@ -567,6 +629,14 @@ function createRemoteSshRuntime(deps = {}) {
 
   function resolveRemoteNodeInBackground(state, child) {
     if (state.remoteNodeResolveInFlight) return;
+    const shellTarget = remoteShellCacheKey(state.profile);
+    // One-shot negative cache: once we've seen this remote reject `sh`,
+    // every later resolver call is guaranteed to fail the same way.
+    // Stay on bare-node-probe mode and don't bother (or spam log).
+    if (state.remoteShell === "windows-cmd") {
+      if (state.remoteShellTarget === shellTarget) return;
+      clearRemoteShellCache(state);
+    }
     state.remoteNodeResolveInFlight = true;
     const finish = (resolved) => {
       if (state.sshChild !== child) return;
@@ -587,11 +657,15 @@ function createRemoteSshRuntime(deps = {}) {
           return;
         }
         if (state.status === "connected") {
-          // TODO(remote-ssh): add a short-lived negative cache for resolver
-          // failures. Some hosts can pass the bare `node` health probe but
-          // still fail this absolute-path resolver; without a retry-after
-          // cache, every reconnect pays another background resolver attempt.
-          log("remote-ssh: remote Node resolver failed after probe success:", resolved && resolved.message);
+          // Stay connected — bare `node` health probe is already keeping
+          // the tunnel green. Only log this once-per-host: if the stderr
+          // is the Windows-cmd "is not recognized" pattern, flip the
+          // one-shot cache so we don't repeat this every reconnect.
+          if (looksLikeWindowsCmdStderr(resolved && resolved.stderr)) {
+            markRemoteShell(state, "windows-cmd", shellTarget);
+          } else {
+            log("remote-ssh: remote Node resolver failed after probe success:", resolved && resolved.message);
+          }
           return;
         }
         finishFailure(state, {
@@ -628,11 +702,13 @@ function createRemoteSshRuntime(deps = {}) {
         return;
       }
       if (state.status === "connected") {
-        // TODO(remote-ssh): add a short-lived negative cache for resolver
-        // failures. Some hosts can pass the bare `node` health probe but
-        // still fail this absolute-path resolver; without a retry-after
-        // cache, every reconnect pays another background resolver attempt.
-        log("remote-ssh: remote Node resolver threw after probe success:", err && err.message);
+        // Same one-shot suppression as finish(): if the throw came from
+        // a Windows-cmd remote rejecting `sh`, flip the cache silently.
+        if (looksLikeWindowsCmdStderr(err && err.stderr)) {
+          markRemoteShell(state, "windows-cmd", shellTarget);
+        } else {
+          log("remote-ssh: remote Node resolver threw after probe success:", err && err.message);
+        }
         return;
       }
       finishFailure(state, {
@@ -680,7 +756,7 @@ function createRemoteSshRuntime(deps = {}) {
     //   (a) connect attempt failed before probe succeeded
     //   (b) connected → ssh died (ServerAlive timed out, network drop)
     //   (c) immediate failure (ENOENT-by-other-means caught here)
-    const stderr = state.stderrBuf || "";
+    const stderr = decodeShellBytes(state.stderrBuf);
     const cls = classifyStderr(stderr);
     const wasConnected = state.status === "connected";
 
@@ -774,9 +850,10 @@ function createRemoteSshRuntime(deps = {}) {
       return;
     }
     const probeCmd = buildProbeCommand(profile.remoteForwardPort, nodeBin);
-    const probeArgs = buildSshArgs(profile, {
-      extraOpts: ["-o", "ConnectTimeout=2"],
-    }).concat([probeCmd]);
+    // No extraOpts override for ConnectTimeout: ssh -o is first-wins, so the
+    // base's ConnectTimeout=15 would always win anyway. PROBE_CHILD_TIMEOUT_MS
+    // (5s) is the real upper bound on each probe attempt.
+    const probeArgs = buildSshArgs(profile).concat([probeCmd]);
 
     let probe;
     try {
@@ -1028,6 +1105,7 @@ function createRemoteSshRuntime(deps = {}) {
     state.retryAttempt = 0;
     state.unknownStrikes = 0;
     state.remoteNodeResolveInFlight = false;
+    clearRemoteShellCache(state);
     setStatus(state, "idle", {
       message: null,
       hint: null,
@@ -1097,7 +1175,12 @@ function killChild(child) {
 }
 
 function stderrSummary(stderr) {
-  const text = (stderr || "").toString().trim();
+  let text;
+  if (Buffer.isBuffer(stderr)) {
+    text = decodeShellBytes(stderr).trim();
+  } else {
+    text = (stderr || "").toString().trim();
+  }
   if (!text) return null;
   return text.length > 200 ? text.slice(0, 200) + "..." : text;
 }
@@ -1127,6 +1210,8 @@ module.exports = {
   classifyProbeExit,
   buildProbeCommand,
   backoffMsForAttempt,
+  looksLikeWindowsCmdStderr,
+  WINDOWS_CMD_STDERR_RX,
   // factory
   createRemoteSshRuntime,
   // constants

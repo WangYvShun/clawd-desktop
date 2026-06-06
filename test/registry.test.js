@@ -16,10 +16,12 @@ describe("Agent Registry", () => {
       "codebuddy",
       "kiro-cli",
       "kimi-cli",
+      "qwen-code",
       "opencode",
       "pi",
       "openclaw",
       "hermes",
+      "qoder",
     ]);
   });
 
@@ -32,9 +34,11 @@ describe("Agent Registry", () => {
     assert.strictEqual(registry.getAgent("cursor-agent").name, "Cursor Agent");
     assert.strictEqual(registry.getAgent("codebuddy").name, "CodeBuddy");
     assert.strictEqual(registry.getAgent("kiro-cli").name, "Kiro CLI");
+    assert.strictEqual(registry.getAgent("qwen-code").name, "Qwen Code");
     assert.strictEqual(registry.getAgent("pi").name, "Pi");
     assert.strictEqual(registry.getAgent("openclaw").name, "OpenClaw");
     assert.strictEqual(registry.getAgent("hermes").name, "Hermes Agent");
+    assert.strictEqual(registry.getAgent("qoder").name, "Qoder");
     assert.strictEqual(registry.getAgent("nonexistent"), undefined);
   });
 
@@ -67,6 +71,12 @@ describe("Agent Registry", () => {
 
     const hermes = registry.getAgent("hermes");
     assert.deepStrictEqual(hermes.processNames.win, ["hermes.exe"]);
+
+    const qwen = registry.getAgent("qwen-code");
+    assert.deepStrictEqual(qwen.processNames.win, ["qwen.exe"]);
+
+    const qoder = registry.getAgent("qoder");
+    assert.deepStrictEqual(qoder.processNames.win, ["qoder.exe", "qodercli.exe", "qoder-cli.exe"]);
   });
 
   it("should include explicit Linux process names", () => {
@@ -99,6 +109,12 @@ describe("Agent Registry", () => {
 
     const hermes = registry.getAgent("hermes");
     assert.deepStrictEqual(hermes.processNames.linux, ["hermes"]);
+
+    const qwen = registry.getAgent("qwen-code");
+    assert.deepStrictEqual(qwen.processNames.linux, ["qwen"]);
+
+    const qoder = registry.getAgent("qoder");
+    assert.deepStrictEqual(qoder.processNames.linux, ["qoder", "qodercli", "qoder-cli"]);
   });
 
   it("should keep Kiro CLI process names narrowed to kiro-cli only", () => {
@@ -121,6 +137,7 @@ describe("Agent Registry", () => {
     assert.ok(agentIds.includes("antigravity-cli"));
     assert.ok(agentIds.includes("cursor-agent"));
     assert.ok(agentIds.includes("kiro-cli"));
+    assert.ok(agentIds.includes("qwen-code"));
     assert.ok(agentIds.includes("pi"));
     assert.ok(agentIds.includes("pi"));
     assert.ok(agentIds.includes("hermes"));
@@ -141,7 +158,8 @@ describe("Agent Registry", () => {
 
     const copilot = registry.getAgent("copilot-cli");
     assert.strictEqual(copilot.capabilities.httpHook, false);
-    assert.strictEqual(copilot.capabilities.permissionApproval, false);
+    assert.strictEqual(copilot.capabilities.permissionApproval, true);
+    assert.strictEqual(copilot.capabilities.interactiveBubble, true);
     assert.strictEqual(copilot.capabilities.sessionEnd, true);
     assert.strictEqual(copilot.capabilities.subagent, true);
 
@@ -175,8 +193,8 @@ describe("Agent Registry", () => {
 
     const pi = registry.getAgent("pi");
     assert.strictEqual(pi.capabilities.httpHook, false);
-    assert.strictEqual(pi.capabilities.permissionApproval, true);
-    assert.strictEqual(pi.capabilities.interactiveBubble, true);
+    assert.strictEqual(pi.capabilities.permissionApproval, false);
+    assert.strictEqual(pi.capabilities.interactiveBubble, false);
     assert.strictEqual(pi.capabilities.sessionEnd, true);
     assert.strictEqual(pi.capabilities.subagent, false);
 
@@ -190,10 +208,27 @@ describe("Agent Registry", () => {
 
     const hermes = registry.getAgent("hermes");
     assert.strictEqual(hermes.capabilities.httpHook, false);
-    assert.strictEqual(hermes.capabilities.permissionApproval, false);
-    assert.strictEqual(hermes.capabilities.interactiveBubble, false);
+    assert.strictEqual(hermes.capabilities.permissionApproval, true);
+    assert.strictEqual(hermes.capabilities.interactiveBubble, true);
     assert.strictEqual(hermes.capabilities.sessionEnd, true);
     assert.strictEqual(hermes.capabilities.subagent, false);
+
+    const qwen = registry.getAgent("qwen-code");
+    assert.strictEqual(qwen.capabilities.httpHook, false);
+    assert.strictEqual(qwen.capabilities.permissionApproval, true);
+    assert.strictEqual(qwen.capabilities.interactiveBubble, true);
+    assert.strictEqual(qwen.capabilities.notificationHook, true);
+    assert.strictEqual(qwen.capabilities.sessionEnd, true);
+    assert.strictEqual(qwen.capabilities.subagent, false);
+
+    const qoder = registry.getAgent("qoder");
+    assert.strictEqual(qoder.capabilities.httpHook, false);
+    // Phase 1 state-only: no permission approval, no interactive bubble.
+    assert.strictEqual(qoder.capabilities.permissionApproval, false);
+    assert.strictEqual(qoder.capabilities.interactiveBubble, false);
+    assert.strictEqual(qoder.capabilities.notificationHook, true);
+    assert.strictEqual(qoder.capabilities.sessionEnd, true);
+    assert.strictEqual(qoder.capabilities.subagent, false);
   });
 
   it("should have eventMap for hook-based agents", () => {
@@ -245,6 +280,24 @@ describe("Agent Registry", () => {
     assert.strictEqual(hermes.eventMap.PreToolUse, "working");
     assert.strictEqual(hermes.eventMap.Stop, "attention");
     assert.strictEqual(hermes.eventMap.SessionEnd, "sleeping");
+
+    const qwen = registry.getAgent("qwen-code");
+    assert.strictEqual(qwen.eventMap.SessionStart, "idle");
+    assert.strictEqual(qwen.eventMap.PreToolUse, "working");
+    assert.strictEqual(qwen.eventMap.PermissionRequest, "notification");
+    // qwen Stop plays the happy end-of-turn animation like other hook agents.
+    // The PostToolUse → UserPromptSubmit self-submit that used to clobber it
+    // is dropped by src/state.js's lastBoundaryAt filter.
+    assert.strictEqual(qwen.eventMap.Stop, "attention");
+
+    const qoder = registry.getAgent("qoder");
+    assert.strictEqual(qoder.eventMap.SessionStart, "idle");
+    assert.strictEqual(qoder.eventMap.PreToolUse, "working");
+    assert.strictEqual(qoder.eventMap.PostToolUseFailure, "error");
+    assert.strictEqual(qoder.eventMap.Stop, "attention");
+    assert.strictEqual(qoder.eventMap.PermissionRequest, "notification");
+    assert.strictEqual(qoder.eventMap.PermissionDenied, "notification");
+    assert.strictEqual(qoder.eventMap.SessionEnd, "sleeping");
   });
 
   it("treats Gemini CLI as a hook-only agent", () => {

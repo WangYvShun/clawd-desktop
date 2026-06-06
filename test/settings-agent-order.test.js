@@ -41,7 +41,8 @@ describe("settings agent order", () => {
       { id: "hermes", name: "Hermes Agent", capabilities: {} },
       { id: "codex", name: "Codex CLI", capabilities: { interactiveBubble: true } },
       { id: "kimi-cli", name: "Kimi CLI", capabilities: { permissionApproval: true, notificationHook: true } },
-      { id: "pi", name: "Pi", capabilities: { permissionApproval: true, interactiveBubble: true } },
+      { id: "qwen-code", name: "Qwen Code", capabilities: { permissionApproval: true, notificationHook: true } },
+      { id: "pi", name: "Pi", capabilities: {} },
     ]);
 
     assert.deepStrictEqual(sorted.map((agent) => agent.id), [
@@ -49,16 +50,26 @@ describe("settings agent order", () => {
       "codex",
       "gemini-cli",
       "kimi-cli",
+      "qwen-code",
       "opencode",
-      "pi",
       "codebuddy",
       "antigravity-cli",
       "cursor-agent",
       "copilot-cli",
       "kiro-cli",
+      "pi",
       "openclaw",
       "hermes",
     ]);
+  });
+
+  it("places Qoder in the collapsible group right after codebuddy", () => {
+    const sorted = sortAgentMetadataForSettings([
+      { id: "qoder", name: "Qoder", capabilities: { notificationHook: true } },
+      { id: "codebuddy", name: "CodeBuddy", capabilities: { permissionApproval: true, notificationHook: true } },
+      { id: "claude-code", name: "Claude Code", capabilities: { permissionApproval: true } },
+    ]);
+    assert.deepStrictEqual(sorted.map((agent) => agent.id), ["claude-code", "codebuddy", "qoder"]);
   });
 
   it("keeps unknown agents in their group but appends them after known priorities by name", () => {

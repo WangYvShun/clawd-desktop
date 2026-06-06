@@ -26,7 +26,6 @@ const {
   shouldBypassCCBubble,
   shouldBypassCodexBubble,
   shouldBypassOpencodeBubble,
-  shouldBypassPiBubble,
 } = require("./server-route-permission");
 const {
   getCodexOfficialTurnKey,
@@ -56,9 +55,11 @@ const clearRuntimeConfigFn = ctx.clearRuntimeConfig || clearRuntimeConfig;
 const getPortCandidatesFn = ctx.getPortCandidates || getPortCandidates;
 const readRuntimePortFn = ctx.readRuntimePort || readRuntimePort;
 const writeRuntimeConfigFn = ctx.writeRuntimeConfig || writeRuntimeConfig;
+const CLAUDE_HOOK_GUARD_NOTICE_TTL_MS = 30 * 60 * 1000;
 
 let httpServer = null;
 let activeServerPort = null;
+let lastClaudeHookGuardNotice = null;
 const codexOfficialTurns = new Map();
 const recentHookEvents = new Map();
 
@@ -123,6 +124,18 @@ function getRuntimeStatus() {
   };
 }
 
+function getClaudeHookGuardStatus() {
+  if (!lastClaudeHookGuardNotice) return null;
+  if (nowFn() - lastClaudeHookGuardNotice.at > CLAUDE_HOOK_GUARD_NOTICE_TTL_MS) return null;
+  return { ...lastClaudeHookGuardNotice };
+}
+
+function clearClaudeHookGuardStatus() {
+  const hadNotice = !!lastClaudeHookGuardNotice;
+  lastClaudeHookGuardNotice = null;
+  return hadNotice;
+}
+
 const integrationSync = createIntegrationSyncRuntime({
   ctx,
   getHookServerPort,
@@ -142,11 +155,43 @@ const {
   syncCodexHooks,
   syncOpencodePlugin,
   syncPiExtension,
-  syncIntegrationForAgent,
-  repairIntegrationForAgent,
+  syncIntegrationForAgent: syncIntegrationForAgentBase,
+  repairIntegrationForAgent: repairIntegrationForAgentBase,
   stopIntegrationForAgent,
   syncEnabledStartupIntegrations,
 } = integrationSync;
+
+function notifySuspiciousShrink(before, after) {
+  lastClaudeHookGuardNotice = {
+    type: "suspicious-shrink",
+    at: nowFn(),
+    before: before ? { ...before } : null,
+    after: after ? { ...after } : null,
+  };
+  if (typeof ctx.notifySuspiciousShrink === "function") {
+    ctx.notifySuspiciousShrink(before, after, lastClaudeHookGuardNotice);
+  }
+}
+
+function shouldClearClaudeHookGuardAfterSync(agentId, result) {
+  if (agentId !== "claude-code") return false;
+  if (result === false) return false;
+  if (result && typeof result === "object" && result.status === "error") return false;
+  return true;
+}
+
+function clearClaudeHookGuardAfterClaudeSync(agentId, result) {
+  if (shouldClearClaudeHookGuardAfterSync(agentId, result)) clearClaudeHookGuardStatus();
+  return result;
+}
+
+function syncIntegrationForAgent(agentId) {
+  return clearClaudeHookGuardAfterClaudeSync(agentId, syncIntegrationForAgentBase(agentId));
+}
+
+function repairIntegrationForAgent(agentId, options = {}) {
+  return clearClaudeHookGuardAfterClaudeSync(agentId, repairIntegrationForAgentBase(agentId, options));
+}
 
 function repairRuntimeStatus() {
   const status = getRuntimeStatus();
@@ -172,6 +217,7 @@ const claudeSettingsWatcher = createClaudeSettingsWatcher({
   isAgentEnabled,
   getHookServerPort,
   syncClawdHooks,
+  notifySuspiciousShrink,
 });
 
 // Watch ~/.claude/ directory for settings.json overwrites (e.g. CC-Switch)
@@ -243,6 +289,7 @@ function startHttpServer() {
 
 function cleanup() {
   clearRuntimeConfigFn();
+  clearClaudeHookGuardStatus();
   stopClaudeSettingsWatcher();
   if (httpServer) httpServer.close();
 }
@@ -251,6 +298,8 @@ return {
   startHttpServer,
   getHookServerPort,
   getRuntimeStatus,
+  getClaudeHookGuardStatus,
+  clearClaudeHookGuardStatus,
   getRecentHookEvents,
   clearRecentHookEvents,
   syncClawdHooks,
@@ -281,7 +330,6 @@ module.exports.__test = {
   shouldBypassCCBubble,
   shouldBypassCodexBubble,
   shouldBypassOpencodeBubble,
-  shouldBypassPiBubble,
   normalizePermissionSuggestions,
   normalizeElicitationToolInput,
   normalizeCodexPermissionToolInput,

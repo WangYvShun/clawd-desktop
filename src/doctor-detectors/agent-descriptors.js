@@ -5,16 +5,19 @@ const { getAgent } = require("../../agents/registry");
 
 const claude = require("../../hooks/install");
 const codex = require("../../hooks/codex-install");
+const copilot = require("../../hooks/copilot-install");
 const cursor = require("../../hooks/cursor-install");
 const gemini = require("../../hooks/gemini-install");
 const antigravity = require("../../hooks/antigravity-install");
 const codebuddy = require("../../hooks/codebuddy-install");
 const kiro = require("../../hooks/kiro-install");
 const kimi = require("../../hooks/kimi-install");
+const qwen = require("../../hooks/qwen-code-install");
 const opencode = require("../../hooks/opencode-install");
 const pi = require("../../hooks/pi-install");
 const openclaw = require("../../hooks/openclaw-install");
 const hermes = require("../../hooks/hermes-install");
+const qoder = require("../../hooks/qoder-install");
 
 function agentName(agentId) {
   const agent = getAgent(agentId);
@@ -57,11 +60,13 @@ const AGENT_DESCRIPTORS = Object.freeze([
     agentId: "copilot-cli",
     agentName: agentName("copilot-cli"),
     eventSource: agentEventSource("copilot-cli"),
-    parentDir: null,
-    configPath: null,
-    configMode: "none-global",
-    autoInstall: false,
-    marker: "copilot-hook.js",
+    parentDir: copilot.resolveCopilotHome(),
+    configPath: copilot.resolveCopilotHooksPath(),
+    settingsPath: copilot.resolveCopilotSettingsPath(),
+    configMode: "copilot-hooks",
+    autoInstall: true,
+    marker: copilot.MARKER,
+    hookEvents: copilot.COPILOT_HOOK_EVENTS,
     scriptPath: path.join(__dirname, "..", "..", "hooks", "copilot-hook.js"),
   }),
   Object.freeze({
@@ -130,6 +135,18 @@ const AGENT_DESCRIPTORS = Object.freeze([
     marker: "kimi-hook.js",
   }),
   Object.freeze({
+    agentId: "qwen-code",
+    agentName: agentName("qwen-code"),
+    eventSource: agentEventSource("qwen-code"),
+    parentDir: qwen.DEFAULT_PARENT_DIR,
+    configPath: qwen.DEFAULT_CONFIG_PATH,
+    configMode: "file",
+    autoInstall: true,
+    marker: qwen.MARKER,
+    nested: true,
+    hookEvents: qwen.QWEN_CODE_HOOK_EVENTS,
+  }),
+  Object.freeze({
     agentId: "opencode",
     agentName: agentName("opencode"),
     eventSource: agentEventSource("opencode"),
@@ -177,6 +194,18 @@ const AGENT_DESCRIPTORS = Object.freeze([
     marker: hermes.PLUGIN_ID,
     managedFiles: hermes.MANAGED_PLUGIN_FILES,
     configFilePath: path.join(hermes.resolveHermesHome(), "config.yaml"),
+  }),
+  Object.freeze({
+    agentId: "qoder",
+    agentName: agentName("qoder"),
+    eventSource: agentEventSource("qoder"),
+    parentDir: qoder.DEFAULT_PARENT_DIR,
+    configPath: qoder.DEFAULT_CONFIG_PATH,
+    configMode: "file",
+    autoInstall: true,
+    marker: qoder.MARKER,
+    nested: true,
+    hookEvents: qoder.QODER_HOOK_EVENTS,
   }),
 ]);
 

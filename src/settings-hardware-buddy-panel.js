@@ -55,6 +55,7 @@
       address: typeof current.address === "string" ? current.address : "",
       namePrefix: typeof current.namePrefix === "string" && current.namePrefix.trim() ? current.namePrefix : DEFAULT_NAME_PREFIX,
       permissionsEnabled: current.permissionsEnabled === true,
+      quickCommandsEnabled: current.quickCommandsEnabled === true,
     };
   }
 

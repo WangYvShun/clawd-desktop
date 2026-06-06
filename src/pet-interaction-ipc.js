@@ -37,6 +37,7 @@ function registerPetInteractionIpc(options = {}) {
     "repositionFloatingBubbles"
   );
   const exitMiniMode = requiredDependency(options.exitMiniMode, "exitMiniMode");
+  const getDisableMiniMode = options.getDisableMiniMode || (() => false);
   const getFocusableLocalHudSessionIds = requiredDependency(
     options.getFocusableLocalHudSessionIds,
     "getFocusableLocalHudSessionIds"
@@ -44,6 +45,7 @@ function registerPetInteractionIpc(options = {}) {
   const focusLog = requiredDependency(options.focusLog, "focusLog");
   const showDashboard = requiredDependency(options.showDashboard, "showDashboard");
   const focusSession = requiredDependency(options.focusSession, "focusSession");
+  const revealSessionHud = requiredDependency(options.revealSessionHud, "revealSessionHud");
   const setLowPowerIdlePaused = requiredDependency(
     options.setLowPowerIdlePaused,
     "setLowPowerIdlePaused"
@@ -81,7 +83,9 @@ function registerPetInteractionIpc(options = {}) {
     }
   });
 
-  on("start-drag-reaction", () => sendToRenderer("start-drag-reaction"));
+  on("start-drag-reaction", (_event, direction) => {
+    sendToRenderer("start-drag-reaction", direction === "left" || direction === "right" ? direction : null);
+  });
   on("end-drag-reaction", () => sendToRenderer("end-drag-reaction"));
   on("play-click-reaction", (_event, svg, duration) => {
     sendToRenderer("play-click-reaction", svg, duration);
@@ -90,7 +94,7 @@ function registerPetInteractionIpc(options = {}) {
   on("drag-end", () => {
     try {
       if (!isMiniMode() && !isMiniTransitioning()) {
-        checkMiniModeSnap();
+        if (!getDisableMiniMode()) checkMiniModeSnap();
         if (isMiniMode() || isMiniTransitioning()) return;
         if (hasPetWindow()) {
           const virtualBounds = getPetWindowBounds();
@@ -113,6 +117,10 @@ function registerPetInteractionIpc(options = {}) {
 
   on("exit-mini-mode", () => {
     if (isMiniMode()) exitMiniMode();
+  });
+
+  on("pet-interaction:reveal-session-hud", () => {
+    revealSessionHud();
   });
 
   on("focus-terminal", () => {

@@ -37,6 +37,7 @@ function initWithConfig(cfg) {
   _miniViewBox = tc.miniModeViewBox || null;
   _fileViewBoxes = tc.fileViewBoxes || {};
   _dragSvg = tc.dragSvg || null;
+  _dragSvgs = tc.dragSvgs || {};
   _idleFollowSvg = tc.idleFollowSvg || "clawd-idle-follow.svg";
   _glyphFlipDefs = tc.glyphFlips || { "pixel-z": 4, "pixel-z-small": 3 };
 
@@ -102,6 +103,15 @@ function getCurrentSvgRoot() {
   } catch {
     return null;
   }
+}
+
+function setCurrentScriptedSvgLowPowerPaused(paused) {
+  const target = clawdEl;
+  if (!target || target.tagName !== "OBJECT") return;
+  try {
+    const fn = target.contentWindow && target.contentWindow.__clawdSetLowPowerPaused;
+    if (typeof fn === "function") fn(!!paused);
+  } catch {}
 }
 
 function shouldPauseForLowPower() {
@@ -204,6 +214,7 @@ function pauseCurrentSvgForLowPower({ waitForBoundary = false } = {}) {
   try {
     if (typeof root.pauseAnimations === "function") root.pauseAnimations();
   } catch {}
+  setCurrentScriptedSvgLowPowerPaused(true);
   setLowPowerSvgPaused(true);
 }
 
@@ -221,6 +232,7 @@ function resumeCurrentSvgForLowPower() {
       if (typeof root.unpauseAnimations === "function") root.unpauseAnimations();
     } catch {}
   }
+  setCurrentScriptedSvgLowPowerPaused(false);
   setLowPowerSvgPaused(false);
 }
 
@@ -334,6 +346,8 @@ let _imgCacheBustSeq = 0;
 let _miniViewBox = null;
 let _fileViewBoxes = {};
 let _dragSvg;
+let _dragSvgs;
+let currentDragSvg = null;
 let _idleFollowSvg;
 let _glyphFlipDefs;
 let _objectScaleCSS;
@@ -599,7 +613,7 @@ function getAssetUrl(file) {
 }
 
 // --- IPC-triggered reactions (from hit window via main relay) ---
-window.electronAPI.onStartDragReaction(() => startDragReaction());
+window.electronAPI.onStartDragReaction((direction) => startDragReaction(direction));
 window.electronAPI.onEndDragReaction(() => endDragReaction());
 window.electronAPI.onPlayClickReaction((svg, duration) => playReaction(svg, duration));
 
@@ -634,26 +648,29 @@ function cancelReaction() {
 }
 
 // --- Drag reaction (loops while dragging) ---
-function startDragReaction() {
-  if (isDragReacting) return;
+function startDragReaction(direction) {
   if (dndEnabled) return;
-  if (!_dragSvg) return;
+  const dragSvg = (direction && _dragSvgs[direction]) || _dragSvg;
+  if (!dragSvg) return;
+  if (isDragReacting && currentDragSvg === dragSvg) return;
 
-  if (isReacting) {
+  if (!isDragReacting && isReacting) {
     if (reactTimer) { clearTimeout(reactTimer); reactTimer = null; }
     isReacting = false;
   }
 
   isDragReacting = true;
+  currentDragSvg = dragSvg;
   detachEyeTracking();
   resumeCurrentSvgForLowPower();
   window.electronAPI.pauseCursorPolling();
-  swapToFile(_dragSvg, null);
+  swapToFile(dragSvg, null);
 }
 
 function endDragReaction() {
   if (!isDragReacting) return;
   isDragReacting = false;
+  currentDragSvg = null;
   window.electronAPI.resumeFromReaction();
 }
 
@@ -1274,6 +1291,72 @@ if (window.electronAPI && typeof window.electronAPI.onCloudlingPointer === "func
 
 // --- Sound playback (IPC from main, receives { url, volume } from theme) ---
 const _audioCache = {};
+const AUDIO_WARMUP_STALE_MS = 10000;
+const AUDIO_WARMUP_DELAY_MS = 50;
+const AUDIO_WARMUP_VOLUME = 0.001;
+let _lastAudioWarmupAt = 0;
+
+function reportSoundPlaybackError(phase, err) {
+  const message = err && err.message ? err.message : String(err || "unknown");
+  if (window.electronAPI && typeof window.electronAPI.reportSoundPlaybackError === "function") {
+    window.electronAPI.reportSoundPlaybackError({ phase, message });
+    return;
+  }
+  try { console.warn(`Clawd sound ${phase} failed:`, message); } catch {}
+}
+
+function cacheAudio(url) {
+  if (typeof url !== "string" || !url) return null;
+  let audio = _audioCache[url];
+  const created = !audio;
+  if (!audio) {
+    audio = new Audio(url);
+    audio.preload = "auto";
+    _audioCache[url] = audio;
+  }
+  if (created) {
+    try { audio.load(); } catch {}
+  }
+  return audio;
+}
+
+function normalizeSoundUrls(payload) {
+  const raw = Array.isArray(payload)
+    ? payload
+    : (payload && Array.isArray(payload.urls) ? payload.urls : []);
+  return raw.filter((url) => typeof url === "string" && url);
+}
+
+function warmAudioOutput(url, { force = false } = {}) {
+  const now = Date.now();
+  if (!force && now - _lastAudioWarmupAt < AUDIO_WARMUP_STALE_MS) {
+    return Promise.resolve();
+  }
+  if (!url) return Promise.resolve();
+  _lastAudioWarmupAt = now;
+
+  const primer = new Audio(url);
+  primer.preload = "auto";
+  primer.volume = AUDIO_WARMUP_VOLUME;
+  return primer.play()
+    .then(() => new Promise((resolve) => {
+      setTimeout(() => {
+        try { primer.pause(); } catch {}
+        resolve();
+      }, AUDIO_WARMUP_DELAY_MS);
+    }))
+    .catch((err) => {
+      reportSoundPlaybackError("warmup", err);
+    });
+}
+
+if (window.electronAPI && typeof window.electronAPI.onPreloadSounds === "function") {
+  window.electronAPI.onPreloadSounds((payload) => {
+    const urls = normalizeSoundUrls(payload);
+    urls.forEach((url) => cacheAudio(url));
+  });
+}
+
 window.electronAPI.onPlaySound((payload) => {
   const url = typeof payload === "string" ? payload : payload && payload.url;
   const volume = typeof payload === "object" && payload && typeof payload.volume === "number"
@@ -1285,14 +1368,14 @@ window.electronAPI.onPlaySound((payload) => {
   // for no benefit since the URL will never be requested again. Only cache
   // real playback URLs.
   const isPreview = url.includes("_t=");
-  let audio = !isPreview ? _audioCache[url] : null;
-  if (!audio) {
-    audio = new Audio(url);
-    if (!isPreview) _audioCache[url] = audio;
-  }
-  audio.volume = volume;
-  audio.currentTime = 0;
-  audio.play().catch(() => {});
+  const audio = isPreview ? new Audio(url) : cacheAudio(url);
+  if (!audio) return;
+  if (isPreview) audio.preload = "auto";
+  warmAudioOutput(url).then(() => {
+    audio.volume = volume;
+    audio.currentTime = 0;
+    audio.play().catch((err) => reportSoundPlaybackError("play", err));
+  });
 });
 // Same-extension override replacement overwrites the file on disk without
 // changing the URL, so the cached Audio object keeps its old buffered data.

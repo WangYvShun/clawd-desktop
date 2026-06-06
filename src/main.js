@@ -1,4 +1,4 @@
-const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell } = require("electron");
+const { app, BrowserWindow, screen, ipcMain, globalShortcut, nativeTheme, dialog, shell, nativeImage, powerSaveBlocker, clipboard } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const { EventEmitter } = require("events");
@@ -14,10 +14,19 @@ const { registerSettingsIpc } = require("./settings-ipc");
 const createSettingsEffectRouter = require("./settings-effect-router");
 const { registerSessionIpc } = require("./session-ipc");
 const { registerPetInteractionIpc } = require("./pet-interaction-ipc");
+const { launchClaudeSession } = require("./launch-claude");
+const { dialog: electronDialog } = require("electron");
 const initPermission = require("./permission");
 const { registerPermissionIpc } = initPermission;
 const { createTelegramApprovalSidecar } = require("./telegram-approval-sidecar");
 const telegramApprovalSettings = require("./telegram-approval-settings");
+const {
+  buildTelegramApprovalStatus,
+  isNativeTelegramApprovalSelected,
+  buildTelegramStatusDiagnostic,
+  formatTelegramStatusDiagnostic,
+} = require("./telegram-approval-runtime-status");
+const { createTelegramMigrationController } = require("./telegram-migration-controller");
 const initUpdateBubble = require("./update-bubble");
 const { registerUpdateBubbleIpc } = initUpdateBubble;
 const createSettingsAnimationOverridesMain = require("./settings-animation-overrides-main");
@@ -41,12 +50,14 @@ const createThemeRuntime = require("./theme-runtime");
 const createAgentRuntimeMain = require("./agent-runtime-main");
 const createFloatingWindowRuntime = require("./floating-window-runtime");
 const createPetWindowRuntime = require("./pet-window-runtime");
+const createMacHideController = require("./mac-hide");
 const { createHardwareBuddyAdapter } = require("./hardware-buddy-adapter");
 const {
   getFocusableLocalHudSessionIds: selectFocusableLocalHudSessionIds,
   getSessionFocusTarget,
 } = require("./session-focus");
 const { focusCodexThreadTarget } = require("./session-focus-handoff");
+const { isSessionInProgress } = require("./state-session-snapshot");
 const { getAllAgents } = require("../agents/registry");
 
 // ── Autoplay policy: allow sound playback without user gesture ──
@@ -73,6 +84,42 @@ if (isWin) {
     _allowSetForeground = user32.func("bool __stdcall AllowSetForegroundWindow(int dwProcessId)");
   } catch (err) {
     console.warn("Clawd: koffi/AllowSetForegroundWindow not available:", err.message);
+  }
+}
+
+// ── Windows: switch the dev console to UTF-8 ──
+//
+// `npm start` attaches Clawd to a parent PowerShell/cmd console. That
+// console defaults to the system codepage (CP936 on zh-CN), so any
+// Chinese string we console.log lands as mojibake — the strings are
+// already UTF-8 in memory (after the GBK stderr decode fix), but the
+// console interprets the bytes as GBK on the way out.
+//
+// SetConsoleOutputCP(65001) tells the attached console to interpret
+// stdout/stderr as UTF-8 while Clawd is running. Packaged builds run under
+// the Windows GUI subsystem with no console attached, so this call is a
+// no-op there.
+let _restoreConsoleOutputCP = null;
+if (isWin) {
+  try {
+    const koffi = require("koffi");
+    const kernel32 = koffi.load("kernel32.dll");
+    const getConsoleOutputCP = kernel32.func("uint __stdcall GetConsoleOutputCP()");
+    const setConsoleOutputCP = kernel32.func("bool __stdcall SetConsoleOutputCP(uint wCodePageID)");
+    const previousOutputCP = getConsoleOutputCP();
+    if (setConsoleOutputCP(65001) && previousOutputCP && previousOutputCP !== 65001) {
+      let restored = false;
+      _restoreConsoleOutputCP = () => {
+        if (restored) return;
+        restored = true;
+        try { setConsoleOutputCP(previousOutputCP); } catch {}
+      };
+      app.once("will-quit", _restoreConsoleOutputCP);
+      process.once("exit", _restoreConsoleOutputCP);
+    }
+  } catch (err) {
+    // Best-effort — mojibake in dev console is annoying but not fatal.
+    console.warn("Clawd: SetConsoleOutputCP(65001) failed:", err && err.message);
   }
 }
 
@@ -180,6 +227,11 @@ let telegramApprovalSidecar = null;
 let telegramApprovalSyncPromise = Promise.resolve();
 let telegramApprovalConfigSignature = "";
 let telegramApprovalTokenRevision = 0;
+let _telegramMigrationController = null;
+let telegramNativeRunner = null;
+let telegramCompanion = null;
+let telegramDirectSend = null;
+let suppressTelegramApprovalSidecarSync = 0;
 let hardwareBuddyAdapter = null;
 let hardwareBuddyStatus = null;
 let hardwareBuddyTestApprovalPromise = null;
@@ -208,6 +260,10 @@ const _settingsController = createSettingsController({
     repairIntegrationForAgent: (id, options) =>
       agentRuntime ? agentRuntime.repairIntegrationForAgent(id, options) : false,
     stopIntegrationForAgent: (id) => agentRuntime ? agentRuntime.stopIntegrationForAgent(id) : false,
+    cleanupIntegrations: (options = {}) => {
+      const { cleanupIntegrations } = require("../hooks/cleanup-integrations.js");
+      return cleanupIntegrations({ ...options, backup: true, silent: true });
+    },
     repairLocalServer: () => _server && typeof _server.repairRuntimeStatus === "function"
       ? _server.repairRuntimeStatus()
       : false,
@@ -223,6 +279,12 @@ const _settingsController = createSettingsController({
     getTelegramApprovalStatus: () => getTelegramApprovalStatus(),
     getTelegramApprovalTokenInfo: () => getTelegramApprovalTokenInfo(),
     sendTelegramApprovalTest: () => sendTelegramApprovalTest(),
+    deleteTelegramApprovalTokenFile: () => deleteTelegramApprovalTokenFile(),
+    // Lazy getter so settings-actions can use the controller even though it's
+    // instantiated below (forward-reference).
+    get telegramMigration() {
+      return _telegramMigrationController;
+    },
     // Theme runtime is wired after theme-loader.init(); keep these closures
     // lazy so settings actions never capture a pre-init runtime reference.
     activateTheme: (id, variantId, overrideMap) => themeRuntime.activateTheme(id, variantId, overrideMap),
@@ -419,6 +481,7 @@ codexPetMain = createCodexPetMain({
   getMainWindow: () => win,
   getSettingsWindow,
   path,
+  reloadActiveTheme: () => themeRuntime.reloadActiveTheme(),
   rebuildAllMenus: () => rebuildAllMenus(),
   settingsController: _settingsController,
   shell,
@@ -539,6 +602,12 @@ function getAssetPointerPayload(bounds, point) {
 
 let win;
 let hitWin;  // input window — small opaque rect over hitbox, receives all pointer events
+
+// Tray icon flash state
+let trayFlashTimer = null;
+let trayFlashStopTimer = null;
+let trayFlashNormalIcon = null;
+let trayFlashHighlightIcon = null;
 let tray = null;
 let contextMenuOwner = null;
 // Mirror of _settingsController.get("size") — initialized from disk, kept in
@@ -601,14 +670,19 @@ let autoStartWithClaude = _settingsController.get("autoStartWithClaude");
 let openAtLogin = _settingsController.get("openAtLogin");
 let bubbleFollowPet = _settingsController.get("bubbleFollowPet");
 let sessionHudEnabled = _settingsController.get("sessionHudEnabled");
+let sessionHudShowStateLabels = _settingsController.get("sessionHudShowStateLabels");
 let sessionHudShowElapsed = _settingsController.get("sessionHudShowElapsed");
 let sessionHudCleanupDetached = _settingsController.get("sessionHudCleanupDetached");
-let sessionHudAutoHide = _settingsController.get("sessionHudAutoHide");
 let sessionHudPinned = _settingsController.get("sessionHudPinned");
+let sessionStaleMs = _settingsController.get("sessionStaleMs");
+let workingStaleMs = _settingsController.get("workingStaleMs");
+let detachedIdleStaleMs = _settingsController.get("detachedIdleStaleMs");
 let soundMuted = _settingsController.get("soundMuted");
 let soundVolume = _settingsController.get("soundVolume");
 let lowPowerIdleMode = _settingsController.get("lowPowerIdleMode");
+let keepAwakeWhileWorking = _settingsController.get("keepAwakeWhileWorking");
 let allowEdgePinningCached = _settingsController.get("allowEdgePinning");
+let disableMiniModeCached = _settingsController.get("disableMiniMode");
 let keepSizeAcrossDisplaysCached = _settingsController.get("keepSizeAcrossDisplays");
 
 function getRuntimeBubblePolicy(kind) {
@@ -619,14 +693,45 @@ function getAllBubblesHidden() {
   return isAllBubblesHidden(_settingsController.getSnapshot());
 }
 
-function togglePetVisibility() { return petWindowRuntime.togglePetVisibility(); }
-function bringPetToPrimaryDisplay() { return petWindowRuntime.bringPetToPrimaryDisplay(); }
+let macHideController = null; // macOS app-hidden ↔ pet visibility bridge (#416); created in whenReady
+// Shared mac prep for any manual "show / move the pet" entry point (tray,
+// shortcut, bring-to-primary): release OS-hide ownership so a later
+// activate/unhide won't falsely restore, and if the app is OS-hidden, unhide it
+// first to avoid a "window shown but app still hidden" limbo.
+function prepManualPetVisibility() {
+  if (macHideController) macHideController.noteManualChange();
+  if (isMac && petWindowRuntime.isPetHidden() && typeof app.isHidden === "function" && app.isHidden()) {
+    try { app.show(); } catch (_) {}
+  }
+}
+function togglePetVisibility() {
+  prepManualPetVisibility();
+  return petWindowRuntime.togglePetVisibility();
+}
+function bringPetToPrimaryDisplay() {
+  prepManualPetVisibility();
+  return petWindowRuntime.bringPetToPrimaryDisplay();
+}
 
 function sendToRenderer(channel, ...args) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, ...args);
 }
 function sendToHitWin(channel, ...args) {
   if (hitWin && !hitWin.isDestroyed()) hitWin.webContents.send(channel, ...args);
+}
+
+function getThemeSoundPreloadUrls() {
+  const urls = [];
+  for (const name of ["complete", "confirm"]) {
+    const url = themeRuntime.getSoundUrl(name);
+    if (url && !urls.includes(url)) urls.push(url);
+  }
+  return urls;
+}
+
+function syncSoundPreloads() {
+  const urls = getThemeSoundPreloadUrls();
+  if (urls.length) sendToRenderer("preload-sounds", { urls });
 }
 
 function setViewportOffsetY(offsetY) { return petWindowRuntime.setViewportOffsetY(offsetY); }
@@ -644,6 +749,7 @@ function syncHitStateAfterLoad() {
 }
 
 function syncRendererStateAfterLoad({ includeStartupRecovery = true } = {}) {
+  syncSoundPreloads();
   sendToRenderer("low-power-idle-mode-change", lowPowerIdleMode);
   if (_mini.getMiniMode()) {
     sendToRenderer("mini-mode-change", true, _mini.getMiniEdge());
@@ -712,6 +818,92 @@ function playSound(name) {
 
 function resetSoundCooldown() {
   lastSoundTime = 0;
+}
+
+function stopTrayFlash() {
+  if (trayFlashTimer) {
+    clearInterval(trayFlashTimer);
+    trayFlashTimer = null;
+  }
+  if (trayFlashStopTimer) {
+    clearTimeout(trayFlashStopTimer);
+    trayFlashStopTimer = null;
+  }
+  const t = _menu.getTray ? _menu.getTray() : null;
+  if (t && trayFlashNormalIcon) {
+    t.setImage(trayFlashNormalIcon);
+  }
+}
+
+function flashTaskbar() {
+  if (doNotDisturb) return;
+  if (!_settingsController.get("flashTaskbarOnComplete")) return;
+
+  const tray = _menu.getTray ? _menu.getTray() : null;
+  if (!tray) return;
+
+  // Cache the normal icon on first call
+  if (!trayFlashNormalIcon) {
+    if (process.platform === "darwin") {
+      trayFlashNormalIcon = nativeImage.createFromPath(
+        path.join(__dirname, "../assets/tray-iconTemplate.png")
+      );
+      trayFlashNormalIcon.setTemplateImage(true);
+    } else {
+      trayFlashNormalIcon = nativeImage.createFromPath(
+        path.join(__dirname, "../assets/tray-icon.png")
+      ).resize({ width: 32, height: 32 });
+    }
+  }
+
+  // Cache the highlight icon (orange circle) on first call
+  if (!trayFlashHighlightIcon) {
+    const flashPath = path.join(__dirname, "../assets/tray-icon-flash.png");
+    if (fs.existsSync(flashPath)) {
+      const img = nativeImage.createFromPath(flashPath).resize({ width: 32, height: 32 });
+      if (!img.isEmpty()) {
+        trayFlashHighlightIcon = img;
+      }
+    }
+  }
+
+  if (!trayFlashHighlightIcon) return;
+
+  // Clear any existing flash timers
+  if (trayFlashTimer) clearInterval(trayFlashTimer);
+  if (trayFlashStopTimer) {
+    clearTimeout(trayFlashStopTimer);
+    trayFlashStopTimer = null;
+  }
+
+  const intervalMs = _settingsController.get("flashIntervalMs") || 500;
+  const durationMs = _settingsController.get("flashDurationMs");
+  // durationMs defaults to 5000; 0 means flash until manually stopped
+
+  let useHighlight = true;
+  trayFlashTimer = setInterval(() => {
+    if (!_menu.getTray || !_menu.getTray()) {
+      stopTrayFlash();
+      return;
+    }
+    const t = _menu.getTray();
+    t.setImage(useHighlight ? trayFlashHighlightIcon : trayFlashNormalIcon);
+    useHighlight = !useHighlight;
+  }, intervalMs);
+
+  // Auto-stop after duration (unless duration is 0 = always)
+  if (durationMs !== 0) {
+    trayFlashStopTimer = setTimeout(() => {
+      stopTrayFlash();
+    }, durationMs || 5000);
+  }
+
+  // Stop on tray click
+  tray.removeAllListeners("click");
+  tray.on("click", () => {
+    stopTrayFlash();
+    tray.removeAllListeners("click");
+  });
 }
 
 function syncHitWin() { return petWindowRuntime.syncHitWin(); }
@@ -795,6 +987,7 @@ const {
   isAgentEnabled: _isAgentEnabled,
   isAgentPermissionsEnabled: _isAgentPermissionsEnabled,
   isAgentNotificationHookEnabled: _isAgentNotificationHookEnabled,
+  isCodexNativeNotificationSoundEnabled: _isCodexNativeNotificationSoundEnabled,
   isCodexPermissionInterceptEnabled: _isCodexPermissionInterceptEnabled,
 } = require("./agent-gate");
 const _permCtx = {
@@ -831,6 +1024,10 @@ const _permCtx = {
   getTelegramApprovalClient: () => getTelegramApprovalClient(),
   onPermissionsChanged: () => {
     if (hardwareBuddyAdapter) hardwareBuddyAdapter.notifyPermissionsChanged();
+  },
+  onPermissionResolved: (permEntry, options = {}) => {
+    if (!_state || typeof _state.clearPermissionNotification !== "function") return;
+    _state.clearPermissionNotification(permEntry && permEntry.sessionId, options);
   },
 };
 const _perm = initPermission(_permCtx);
@@ -910,6 +1107,11 @@ let showDashboard = () => {};
 let broadcastDashboardSessionSnapshot = () => {};
 let sendDashboardI18n = () => {};
 
+// Forward hook for the #329 updater scheduler. State/mini ctxs reference
+// this via notifyUpdaterSilentExit; the actual implementation is wired
+// after the updater module is constructed below.
+let notifyUpdaterSilentExit = () => {};
+
 const _stateCtx = {
   get theme() { return getActiveTheme(); },
   get win() { return win; },
@@ -929,10 +1131,12 @@ const _stateCtx = {
   set forceEyeResend(v) { setForceEyeResend(v); },
   get mouseStillSince() { return _tick ? _tick._mouseStillSince : Date.now(); },
   get pendingPermissions() { return pendingPermissions; },
+  notifyUpdaterSilentExit: () => notifyUpdaterSilentExit(),
   sendToRenderer,
   sendToHitWin,
   syncHitWin,
   playSound,
+  flashTaskbar,
   t: (key) => t(key),
   focusTerminalWindow: (...args) => focusTerminalWindow(...args),
   resolvePermissionEntry: (...args) => resolvePermissionEntry(...args),
@@ -956,10 +1160,17 @@ const _stateCtx = {
   buildTrayMenu: () => buildTrayMenu(),
   debugLog: (msg) => sessionLog(msg),
   broadcastSessionSnapshot: (snapshot) => {
+    reconcilePowerSaveBlocker();
     broadcastDashboardSessionSnapshot(snapshot);
     broadcastSessionHudSnapshot(snapshot);
     repositionFloatingBubbles();
     if (hardwareBuddyAdapter) hardwareBuddyAdapter.notifyStateChanged();
+    // R1a: best-effort completion notifications. Must never throw or block the
+    // broadcast — the companion computes synchronously and fires sends async.
+    if (telegramCompanion) {
+      try { telegramCompanion.onSnapshot(snapshot); } catch {}
+    }
+    if (_lanWss) { try { _lanWss.onSnapshot(); } catch {} }
   },
   // Phase 3b: 读 prefs.themeOverrides 判断某个 oneshot state 是否被用户禁用。
   // state.js gate 调这个做 early-return。不做白名单校验——settings-actions
@@ -975,6 +1186,11 @@ const _stateCtx = {
     return !!(entry && entry.disabled === true);
   },
   get sessionHudCleanupDetached() { return sessionHudCleanupDetached; },
+  getStaleConfig: () => ({
+    sessionStaleMs,
+    workingStaleMs,
+    detachedIdleStaleMs,
+  }),
   getSessionAliases: () => _settingsController.get("sessionAliases"),
   hasAnyEnabledAgent: () => {
     // `get("agents")` returns the live reference (no clone) — we're only
@@ -998,6 +1214,39 @@ const { setState, applyState, updateSession, resolveDisplayState, getSvgOverride
         startWakePoll, stopWakePoll, detectRunningAgentProcesses,
         startStartupRecovery: _startStartupRecovery } = _state;
 const sessions = _state.sessions;
+
+// ── Keep-awake: block OS sleep while any agent task is in progress ──
+// State→in-progress mapping lives in state-session-snapshot.isSessionInProgress
+// (kept as a pure helper so the semantics are unit-tested).
+let powerSaveBlockerId = null;
+function anySessionInProgress() {
+  for (const [, s] of sessions) {
+    if (isSessionInProgress(s)) return true;
+  }
+  return false;
+}
+function reconcilePowerSaveBlocker() {
+  try {
+    const shouldBlock = keepAwakeWhileWorking && anySessionInProgress();
+    const active = powerSaveBlockerId !== null && powerSaveBlocker.isStarted(powerSaveBlockerId);
+    if (shouldBlock && !active) {
+      powerSaveBlockerId = powerSaveBlocker.start("prevent-app-suspension");
+    } else if (!shouldBlock && active) {
+      powerSaveBlocker.stop(powerSaveBlockerId);
+      powerSaveBlockerId = null;
+    }
+  } catch (err) {
+    console.warn("Clawd: reconcilePowerSaveBlocker failed:", err);
+  }
+}
+function releasePowerSaveBlocker() {
+  try {
+    if (powerSaveBlockerId !== null && powerSaveBlocker.isStarted(powerSaveBlockerId)) {
+      powerSaveBlocker.stop(powerSaveBlockerId);
+    }
+  } catch {}
+  powerSaveBlockerId = null;
+}
 
 // ── Hit-test: SVG bounding box → screen coordinates ──
 function getHitRectScreen(bounds) { return petWindowRuntime.getHitRectScreen(bounds); }
@@ -1044,30 +1293,36 @@ const { startMainTick, resetIdleTimer } = _tick;
 
 // ── Terminal focus — delegated to src/focus.js ──
 const _focus = require("./focus")({ _allowSetForeground, focusLog });
-const { initFocusHelper, killFocusHelper, focusTerminalWindow, clearMacFocusCooldownTimer } = _focus;
+const {
+  initFocusHelper,
+  killFocusHelper,
+  focusTerminalWindow,
+  captureGhosttyTerminalId,
+  clearMacFocusCooldownTimer,
+} = _focus;
 
 function getFocusableLocalHudSessionIds() {
   if (!_state || typeof _state.buildSessionSnapshot !== "function") return [];
-  return selectFocusableLocalHudSessionIds(_state.buildSessionSnapshot());
+  return selectFocusableLocalHudSessionIds(_state.buildSessionSnapshot(), { osPlatform: process.platform });
 }
 
 function focusTerminalSession(session, sessionId, requestSource) {
   if (!session || !session.sourcePid) return false;
-  focusTerminalWindow({
+  return focusTerminalWindow({
     sourcePid: session.sourcePid,
     wtHwnd: session.wtHwnd,
     cwd: session.cwd,
     editor: session.editor,
     pidChain: session.pidChain,
+    ghosttyTerminalId: session.ghosttyTerminalId,
     sessionId: String(sessionId),
     agentId: session.agentId,
     requestSource,
   });
-  return true;
 }
 
 function focusDashboardSession(sessionId, options = {}) {
-  if (!sessionId) return;
+  if (!sessionId) return false;
   const requestSource = options.requestSource || "dashboard";
   const id = String(sessionId);
   const session = sessions.get(id);
@@ -1076,11 +1331,11 @@ function focusDashboardSession(sessionId, options = {}) {
     : null;
   if (!session && !fallbackEntry) {
     focusLog(`focus result branch=none reason=session-not-found source=${requestSource} sid=${id}`);
-    return;
+    return false;
   }
 
   const focusEntry = { ...(session || {}), ...(fallbackEntry || {}), id };
-  const focusTarget = getSessionFocusTarget(focusEntry);
+  const focusTarget = getSessionFocusTarget(focusEntry, { osPlatform: process.platform });
   if (focusTarget.type === "codex-thread" && focusTarget.url) {
     focusCodexThreadTarget({
       shell,
@@ -1091,12 +1346,11 @@ function focusDashboardSession(sessionId, options = {}) {
       focusLog,
       focusTerminalSession,
     });
-    return;
+    return true;
   }
 
   if (focusTarget.type === "terminal") {
-    focusTerminalSession(focusEntry, id, requestSource);
-    return;
+    return focusTerminalSession(focusEntry, id, requestSource);
   }
 
   if (focusEntry.platform === "webui") {
@@ -1104,6 +1358,7 @@ function focusDashboardSession(sessionId, options = {}) {
   } else {
     focusLog(`focus result branch=none reason=no-source-pid source=${requestSource} sid=${id}`);
   }
+  return false;
 }
 
 function hideDashboardSession(sessionId) {
@@ -1134,8 +1389,8 @@ const _sessionHud = require("./session-hud")({
   get win() { return win; },
   get petHidden() { return petWindowRuntime.isPetHidden(); },
   get sessionHudEnabled() { return sessionHudEnabled; },
+  get sessionHudShowStateLabels() { return sessionHudShowStateLabels; },
   get sessionHudShowElapsed() { return sessionHudShowElapsed; },
-  get sessionHudAutoHide() { return sessionHudAutoHide; },
   get sessionHudPinned() { return sessionHudPinned; },
   getMiniMode: () => _mini.getMiniMode(),
   getMiniTransitioning: () => _mini.getMiniTransitioning(),
@@ -1162,6 +1417,7 @@ agentRuntime = createAgentRuntimeMain({
   getPermissionRuntime: () => _perm,
   isAgentEnabled: (agentId) => _isAgentEnabled(_settingsController.getSnapshot(), agentId),
   updateSession: (sessionId, state, event, opts) => updateSession(sessionId, state, event, opts),
+  captureGhosttyTerminalId,
   showCodexNotifyBubble: (payload) => showCodexNotifyBubble(payload),
   clearCodexNotifyBubbles: (...args) => clearCodexNotifyBubbles(...args),
 });
@@ -1180,6 +1436,7 @@ const _serverCtx = {
   get sessions() { return sessions; },
   isAgentEnabled: (agentId) => _isAgentEnabled({ agents: _settingsController.get("agents") }, agentId),
   isAgentPermissionsEnabled: (agentId) => _isAgentPermissionsEnabled({ agents: _settingsController.get("agents") }, agentId),
+  isCodexNativeNotificationSoundEnabled: () => _isCodexNativeNotificationSoundEnabled({ agents: _settingsController.get("agents") }),
   isCodexPermissionInterceptEnabled: () => _isCodexPermissionInterceptEnabled({ agents: _settingsController.get("agents") }),
   codexSubagentClassifier: agentRuntime.getCodexSubagentClassifier(),
   setState,
@@ -1196,6 +1453,17 @@ const _serverCtx = {
 const _server = require("./server")(_serverCtx);
 const { startHttpServer, getHookServerPort } = _server;
 
+// ── LAN WebSocket bridge for PWA mobile clients (lazy-loaded) ──
+let _lanWss = null;
+if (_settingsController.get("mobilePreviewEnabled") === true) {
+  const { initMobilePreviewServer } = require("./network/mobile-preview-server");
+  _lanWss = initMobilePreviewServer({
+    sessions,
+    getSettingsSnapshot: () => _settingsController.getSnapshot(),
+    isEnabled: () => _settingsController.get("mobilePreviewEnabled") === true,
+  });
+}
+
 function updateLog(msg) {
   if (!updateDebugLog) return;
   const { rotatedAppend } = require("./log-rotate");
@@ -1208,6 +1476,16 @@ function sessionLog(msg) {
   rotatedAppend(sessionDebugLog, `[${new Date().toISOString()}] ${msg}\n`);
 }
 
+ipcMain.on("sound-playback-error", (_event, payload) => {
+  const phase = payload && typeof payload.phase === "string"
+    ? payload.phase.replace(/[^a-z0-9_-]/gi, "").slice(0, 32)
+    : "unknown";
+  const message = payload && typeof payload.message === "string"
+    ? payload.message.replace(/\s+/g, " ").slice(0, 240)
+    : "unknown";
+  sessionLog(`sound playback error phase=${phase || "unknown"} message=${message || "unknown"}`);
+});
+
 function focusLog(msg) {
   if (!focusDebugLog) return;
   const { rotatedAppend } = require("./log-rotate");
@@ -1215,19 +1493,118 @@ function focusLog(msg) {
 }
 
 function getTelegramApprovalClient() {
+  const controller = _telegramMigrationController;
+  if (controller && typeof controller.getSnapshot === "function") {
+    const snap = controller.getSnapshot() || {};
+    if (isNativeTelegramApprovalSelected(snap)) {
+      if (snap.state === "NATIVE_ACTIVE"
+        && telegramNativeRunner
+        && typeof telegramNativeRunner.isPolling === "function"
+        && telegramNativeRunner.isPolling()
+        && typeof telegramNativeRunner.requestApproval === "function") {
+        return telegramNativeRunner;
+      }
+      return null;
+    }
+  }
   if (!telegramApprovalSidecar || typeof telegramApprovalSidecar.getClient !== "function") return null;
   return telegramApprovalSidecar.getClient();
 }
 
+// R1a companion notifications are native-only: the legacy sidecar has no
+// sendNotification surface, so legacy users silently lack completion pings
+// (Settings copy must say so — tracked for a follow-up UI pass). Unlike
+// getTelegramApprovalClient this never falls back to the sidecar.
+function getTelegramCompanionClient() {
+  const controller = _telegramMigrationController;
+  if (controller && typeof controller.getSnapshot === "function") {
+    const snap = controller.getSnapshot() || {};
+    if (snap.state === "NATIVE_ACTIVE"
+      && telegramNativeRunner
+      && typeof telegramNativeRunner.sendNotification === "function") {
+      return telegramNativeRunner;
+    }
+  }
+  return null;
+}
+
 function telegramApprovalLog(level, message, meta = {}) {
-  const parts = [`telegram approval sidecar ${level}: ${message}`];
+  const parts = [`telegram approval ${level}: ${message}`];
   if (meta && meta.text) parts.push(String(meta.text).trim());
   if (meta && meta.error) parts.push(String(meta.error).trim());
+  for (const key of ["errorClass", "errorCode", "delayMs", "id", "sessionId", "messageId", "status", "reason", "fallbackReason"]) {
+    const value = meta && meta[key];
+    if (value !== undefined && value !== null && value !== "") {
+      parts.push(`${key}=${String(value).trim()}`);
+    }
+  }
   permLog(parts.filter(Boolean).join(" | "));
 }
 
 function getTelegramApprovalPrefs() {
   return telegramApprovalSettings.normalizeTelegramApproval(_settingsController.get("tgApproval"));
+}
+
+function getTelegramMigrationPrefs() {
+  const raw = _settingsController.get("tgMigration");
+  return raw && typeof raw === "object" ? raw : {};
+}
+
+function readTelegramMigrationPrefsForController() {
+  const raw = { ...getTelegramMigrationPrefs() };
+  if (typeof raw.legacyEnabled !== "boolean") {
+    raw.legacyEnabled = getTelegramApprovalPrefs().enabled === true;
+  }
+  return raw;
+}
+
+function hasCompleteTelegramApprovalConfig(config, tokenInfo) {
+  return !!(
+    tokenInfo && tokenInfo.tokenStored === true
+    && config && config.allowedTgUserId
+    && config.targetSessionKey
+  );
+}
+
+function isTelegramLegacySidecarSyncAllowed() {
+  const migration = getTelegramMigrationPrefs();
+  if (migration.transport === "native" || migration.transport === "off") return false;
+  const controller = _telegramMigrationController;
+  if (controller && typeof controller.getSnapshot === "function") {
+    const snap = controller.getSnapshot() || {};
+    if (snap.state === "NATIVE_ACTIVE" || snap.state === "TESTING_NATIVE") return false;
+    if (snap.transport === "native" || snap.transport === "off") return false;
+  }
+  return true;
+}
+
+async function applySettingsUpdateOrThrow(key, value, label) {
+  const result = await Promise.resolve(_settingsController.applyUpdate(key, value));
+  if (!result || result.status !== "ok") {
+    throw new Error((result && result.message) || `${label || key} update failed`);
+  }
+  return result;
+}
+
+async function setTelegramApprovalEnabledForMigration(enabled) {
+  const current = getTelegramApprovalPrefs();
+  if (current.enabled === enabled) return;
+  suppressTelegramApprovalSidecarSync += 1;
+  try {
+    await applySettingsUpdateOrThrow("tgApproval", { ...current, enabled }, "tgApproval");
+  } finally {
+    suppressTelegramApprovalSidecarSync = Math.max(0, suppressTelegramApprovalSidecarSync - 1);
+  }
+}
+
+async function persistTelegramMigrationPatch(patch) {
+  const cur = getTelegramMigrationPrefs();
+  await applySettingsUpdateOrThrow("tgMigration", { ...cur, ...patch }, "tgMigration");
+  if (patch && patch.transport === "legacy") {
+    await setTelegramApprovalEnabledForMigration(true);
+  } else if (patch && (patch.transport === "native" || patch.transport === "off")) {
+    await setTelegramApprovalEnabledForMigration(false);
+  }
 }
 
 // Canonical paths only — no env-var override. The Settings "Save token" button,
@@ -1284,18 +1661,90 @@ function buildTelegramApprovalSignature(config, paths, tokenStatus) {
 function getTelegramApprovalStatus() {
   const config = getTelegramApprovalPrefs();
   const token = getTelegramApprovalTokenStatus();
-  const ready = telegramApprovalSettings.readiness(config, token);
   const sidecarStatus = telegramApprovalSidecar && typeof telegramApprovalSidecar.getStatus === "function"
     ? telegramApprovalSidecar.getStatus()
     : { status: "stopped" };
+  const migrationSnapshot = _telegramMigrationController && typeof _telegramMigrationController.getSnapshot === "function"
+    ? _telegramMigrationController.getSnapshot()
+    : null;
+  const nativePolling = telegramNativeRunner
+    && typeof telegramNativeRunner.isPolling === "function"
+    && telegramNativeRunner.isPolling();
+  return buildTelegramApprovalStatus({
+    config,
+    token,
+    sidecarStatus,
+    migrationSnapshot,
+    nativePolling,
+  });
+}
+
+function getPendingTelegramApprovalCount() {
+  return pendingPermissions.filter((entry) =>
+    entry
+    && !entry.isCodexNotify
+    && !entry.isKimiNotify
+    && !entry.isHardwareBuddyTest
+  ).length;
+}
+
+function getTelegramNativeRunnerStatus() {
+  if (telegramNativeRunner && typeof telegramNativeRunner.getStatus === "function") {
+    try { return telegramNativeRunner.getStatus(); } catch {}
+  }
   return {
-    ...sidecarStatus,
-    enabled: config.enabled === true,
-    configured: ready.ready === true,
-    reason: ready.reason || "",
-    message: sidecarStatus.message || ready.message || "",
-    tokenStored: token.tokenStored === true,
+    polling: !!(telegramNativeRunner
+      && typeof telegramNativeRunner.isPolling === "function"
+      && telegramNativeRunner.isPolling()),
+    pendingApprovalCount: telegramNativeRunner && telegramNativeRunner._pendingApprovals
+      ? telegramNativeRunner._pendingApprovals.size
+      : 0,
+    lastError: null,
   };
+}
+
+function buildTelegramStatusCommandText(options = {}) {
+  const config = getTelegramApprovalPrefs();
+  const token = getTelegramApprovalTokenStatus();
+  const sidecarStatus = telegramApprovalSidecar && typeof telegramApprovalSidecar.getStatus === "function"
+    ? telegramApprovalSidecar.getStatus()
+    : { status: "stopped" };
+  const migrationSnapshot = _telegramMigrationController && typeof _telegramMigrationController.getSnapshot === "function"
+    ? _telegramMigrationController.getSnapshot()
+    : null;
+  const nativeRunnerStatus = getTelegramNativeRunnerStatus();
+  const nativePolling = nativeRunnerStatus && nativeRunnerStatus.polling === true;
+  const approvalStatus = buildTelegramApprovalStatus({
+    config,
+    token,
+    sidecarStatus,
+    migrationSnapshot,
+    nativePolling,
+  });
+  const sessionSnapshot = _state && typeof _state.buildSessionSnapshot === "function"
+    ? _state.buildSessionSnapshot()
+    : null;
+  const diagnostic = buildTelegramStatusDiagnostic({
+    config,
+    token,
+    approvalStatus,
+    migrationSnapshot,
+    nativeRunnerStatus,
+    nativePolling,
+    pendingApprovalCount: getPendingTelegramApprovalCount(),
+    sessionSnapshot,
+    now: Date.now(),
+    all: options && options.all === true,
+  });
+  return formatTelegramStatusDiagnostic(diagnostic, {
+    all: options && options.all === true,
+    lang: _settingsController.get("lang") || lang || "en",
+  });
+}
+
+function handleTelegramNativeCommand({ command, args } = {}) {
+  if (command !== "status") return null;
+  return buildTelegramStatusCommandText({ all: true });
 }
 
 function writeTelegramApprovalToken(token) {
@@ -1312,6 +1761,47 @@ function writeTelegramApprovalToken(token) {
     queueTelegramApprovalSidecarSync("token");
   }
   return result;
+}
+
+function isTelegramTokenFileRequiredByNative() {
+  const migration = getTelegramMigrationPrefs();
+  if (migration.transport === "native") return true;
+  const controller = _telegramMigrationController;
+  if (!controller || typeof controller.getSnapshot !== "function") return false;
+  const snap = controller.getSnapshot() || {};
+  const owner = snap.ownerSnapshot || {};
+  return snap.state === "NATIVE_ACTIVE"
+    || snap.state === "TESTING_NATIVE"
+    || owner.nativePolling === true;
+}
+
+async function deleteTelegramApprovalTokenFile() {
+  if (isTelegramTokenFileRequiredByNative()) {
+    return {
+      status: "error",
+      code: "TOKEN_FILE_IN_USE",
+      message: "Native Telegram currently uses the shared token file. Keep it until native token storage is split.",
+    };
+  }
+  const paths = getTelegramApprovalPaths();
+  if (telegramApprovalSidecar) {
+    await stopTelegramApprovalSidecar();
+  }
+  try {
+    fs.unlinkSync(paths.tokenEnvFilePath);
+    telegramApprovalTokenRevision += 1;
+    queueTelegramApprovalSidecarSync("token-delete");
+    return { status: "ok", deleted: true };
+  } catch (err) {
+    if (err && err.code === "ENOENT") {
+      return { status: "ok", deleted: false, noop: true };
+    }
+    return {
+      status: "error",
+      code: err && err.code ? err.code : "DELETE_FAILED",
+      message: `Telegram token file delete failed: ${err && err.message ? err.message : err}`,
+    };
+  }
 }
 
 async function startTelegramApprovalSidecar() {
@@ -1387,6 +1877,179 @@ async function startTelegramApprovalSidecar() {
   return false;
 }
 
+async function initTelegramMigrationController() {
+  if (_telegramMigrationController) return _telegramMigrationController;
+  const paths = getTelegramApprovalPaths();
+
+  // Sidecar handle: forwards to the existing async start/stop functions so
+  // there is exactly one sidecar lifecycle in the process.
+  const sidecarHandle = {
+    isRunning: () => !!(telegramApprovalSidecar && telegramApprovalSidecar.isRunning && telegramApprovalSidecar.isRunning()),
+    start: async () => {
+      await setTelegramApprovalEnabledForMigration(true);
+      const started = await startTelegramApprovalSidecar();
+      if (!started) {
+        const err = new Error("Telegram approval sidecar did not start");
+        err.code = "SIDECAR_START_FAILED";
+        throw err;
+      }
+      return true;
+    },
+    stop: () => stopTelegramApprovalSidecar(),
+  };
+
+  // Native handle: spike-level real implementation. Token comes from the same
+  // env file the sidecar uses; production transport closes over the token.
+  const { envFileTokenStore } = require("./telegram-token-store");
+  const {
+    createClipboardFallbackDeliveryAdapter,
+    createTelegramDirectSend,
+    createWindowsPasteOnlyDeliveryAdapter,
+  } = require("./telegram-direct-send");
+  const { createTelegramNativeRunner } = require("./telegram-native-runner");
+  const tokenStore = envFileTokenStore({ filePath: paths.tokenEnvFilePath });
+  telegramDirectSend = createTelegramDirectSend({
+    getSessionSnapshot: () => _state && typeof _state.buildSessionSnapshot === "function"
+      ? _state.buildSessionSnapshot()
+      : { sessions: [] },
+    getPendingPermissions: () => pendingPermissions,
+    focusSession: (sessionId, options) => focusDashboardSession(sessionId, options),
+    deliveryAdapter: createWindowsPasteOnlyDeliveryAdapter({
+      clipboard,
+      restoreClipboardOnSuccess: true,
+    }),
+    fallbackAdapter: createClipboardFallbackDeliveryAdapter({ clipboard }),
+    isEnabled: () => {
+      const snap = _telegramMigrationController && typeof _telegramMigrationController.getSnapshot === "function"
+        ? _telegramMigrationController.getSnapshot()
+        : null;
+      return !!(snap && snap.state === "NATIVE_ACTIVE"
+        && getTelegramApprovalPrefs().r3DirectSendEnabled === true);
+    },
+    osPlatform: process.platform,
+    log: telegramApprovalLog,
+  });
+  const nativeRunner = createTelegramNativeRunner({
+    tokenStore,
+    transport: makeFetchTransport({ tokenStore }),
+    getDispatch: () => _telegramMigrationController && _telegramMigrationController.dispatch,
+    getChatId: () => {
+      const cfg = getTelegramApprovalPrefs();
+      const key = cfg && cfg.targetSessionKey;
+      // targetSessionKey is "telegram:<chat>:..." — extract chat id.
+      const m = typeof key === "string" ? key.match(/^telegram:(-?\d+)/) : null;
+      return m ? m[1] : "";
+    },
+    getAllowedUserId: () => {
+      const cfg = getTelegramApprovalPrefs();
+      return (cfg && cfg.allowedTgUserId) || "";
+    },
+    isCommandEnabled: () => {
+      const snap = _telegramMigrationController && typeof _telegramMigrationController.getSnapshot === "function"
+        ? _telegramMigrationController.getSnapshot()
+        : null;
+      return !!(snap && snap.state === "NATIVE_ACTIVE");
+    },
+    onCommand: (payload) => handleTelegramNativeCommand(payload),
+    isTextMessageEnabled: () => {
+      const snap = _telegramMigrationController && typeof _telegramMigrationController.getSnapshot === "function"
+        ? _telegramMigrationController.getSnapshot()
+        : null;
+      return !!(snap && snap.state === "NATIVE_ACTIVE"
+        && getTelegramApprovalPrefs().r3DirectSendEnabled === true);
+    },
+    onTextMessage: (payload) => telegramDirectSend && telegramDirectSend.handleTextMessage(payload),
+    log: telegramApprovalLog,
+  });
+  telegramNativeRunner = nativeRunner;
+
+  // R1a: completion notifications ride the existing snapshot fanout. The
+  // companion holds its own dedupe state (the snapshot carries no prev) and
+  // only sends while native is the active owner + the user left the toggle on.
+  const { createTelegramCompanion } = require("./telegram-companion");
+  telegramCompanion = createTelegramCompanion({
+    getClient: () => getTelegramCompanionClient(),
+    getLang: () => _settingsController.get("lang") || lang || "en",
+    getCompletionOutputMode: () => getTelegramApprovalPrefs().completionOutputMode || "off",
+    getNotifyOnComplete: () => getTelegramApprovalPrefs().notifyOnComplete === true,
+    // Native-active client present. The companion still advances its dedupe map
+    // while native is inactive, and internally decides whether to send a bare
+    // ping or require assistant output based on tgApproval prefs.
+    isEnabled: () => !!getTelegramCompanionClient(),
+    onNotificationSent: ({ entry, messageId }) => {
+      if (telegramDirectSend && typeof telegramDirectSend.registerCompletionNotification === "function") {
+        telegramDirectSend.registerCompletionNotification({
+          messageId,
+          sessionId: entry && entry.id,
+        });
+      }
+    },
+    log: telegramApprovalLog,
+  });
+
+  _telegramMigrationController = createTelegramMigrationController({
+    sidecar: sidecarHandle,
+    native: nativeRunner,
+    readPrefs: () => readTelegramMigrationPrefsForController(),
+    writePrefs: (patch) => persistTelegramMigrationPatch(patch),
+    readFiles: () => {
+      const cfg = getTelegramApprovalPrefs();
+      const tokenInfo = getTelegramApprovalTokenStatus();
+      const hasTokenFile = !!(tokenInfo && tokenInfo.tokenStored);
+      const configComplete = hasCompleteTelegramApprovalConfig(cfg, tokenInfo);
+      return {
+        hasLegacyEnvFile: hasTokenFile,
+        legacyConfigComplete: configComplete,
+        nativeConfigComplete: configComplete,
+      };
+    },
+    log: telegramApprovalLog,
+  });
+
+  await _telegramMigrationController.init();
+  return _telegramMigrationController;
+}
+
+// Minimal fetch-based transport for the native client. Closes over the token
+// (no per-call token argument) so logging or debug serialization of request
+// args cannot leak the secret.
+function makeFetchTransport({ tokenStore }) {
+  return async ({ method, payload, signal }) => {
+    const token = await tokenStore.getToken();
+    if (!token) {
+      return { ok: false, status: null, error_code: "TOKEN_MISSING", description: "no token" };
+    }
+    const url = `https://api.telegram.org/bot${token}/${method}`;
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload || {}),
+        signal,
+      });
+    } catch (err) {
+      if (err && err.name === "AbortError") throw err;
+      throw Object.assign(new Error(err && err.message ? err.message : String(err)), {
+        code: (err && (err.code || (err.cause && err.cause.code))) || undefined,
+        causeCode: err && err.cause && err.cause.code,
+      });
+    }
+    const status = res.status;
+    let body;
+    try { body = await res.json(); } catch { body = null; }
+    if (!body) return { ok: false, status, error_code: status, description: res.statusText || "" };
+    if (body.ok) return { ok: true, result: body.result };
+    return {
+      ok: false,
+      status,
+      error_code: body.error_code || status,
+      description: body.description || "",
+      parameters: body.parameters || {},
+    };
+  };
+}
+
 function stopTelegramApprovalSidecar() {
   const sidecar = telegramApprovalSidecar;
   telegramApprovalSidecar = null;
@@ -1398,6 +2061,11 @@ function stopTelegramApprovalSidecar() {
 }
 
 async function syncTelegramApprovalSidecar(reason = "settings") {
+  if (!isTelegramLegacySidecarSyncAllowed()) {
+    if (telegramApprovalSidecar) await stopTelegramApprovalSidecar();
+    telegramApprovalLog("debug", `sync ${reason} skipped by migration transport`);
+    return false;
+  }
   const config = getTelegramApprovalPrefs();
   const paths = getTelegramApprovalPaths();
   const token = getTelegramApprovalTokenStatus();
@@ -1427,6 +2095,9 @@ function telegramApprovalUnavailableMessage(status) {
   if (status && status.reason === "disabled") return "Telegram approval is disabled";
   if (status && status.reason === "missing-token") return "Telegram bot token is not configured";
   if (status && status.reason === "invalid-config") return "Telegram approval config is incomplete";
+  if (status && status.reason === "native-inactive") return "Native Telegram approval is not active";
+  if (status && status.reason === "native-testing") return "Native Telegram approval test is already in progress";
+  if (status && status.transport === "native") return "Native Telegram approval is not active";
   return "Telegram approval sidecar is not running";
 }
 
@@ -1435,7 +2106,9 @@ async function sendTelegramApprovalTest() {
   if (beforeStatus.configured !== true) {
     return { status: "error", message: telegramApprovalUnavailableMessage(beforeStatus) };
   }
-  await queueTelegramApprovalSidecarSync("test");
+  if (!(beforeStatus && beforeStatus.transport === "native")) {
+    await queueTelegramApprovalSidecarSync("test");
+  }
   const client = getTelegramApprovalClient();
   if (!client || typeof client.requestApproval !== "function") {
     return { status: "error", message: telegramApprovalUnavailableMessage(getTelegramApprovalStatus()) };
@@ -1449,6 +2122,9 @@ async function sendTelegramApprovalTest() {
     }, { signal: controller.signal });
     if (decision === "allow" || decision === "deny") {
       return { status: "ok", decision };
+    }
+    if (decision && (decision.action === "allow" || decision.action === "deny")) {
+      return { status: "ok", decision: decision.action };
     }
     return { status: "error", message: "Telegram test did not receive a button response" };
   } finally {
@@ -1700,6 +2376,106 @@ unsubscribeHardwareBuddySettings = _settingsController.subscribeKey("hardwareBud
 // effects that used to live inside setters (e.g.
 // `syncPermissionShortcuts()` for hideBubbles) are now reactive and live in
 // the subscriber too.
+
+async function confirmDangerousMode(t) {
+  const parent = win && !win.isDestroyed() ? win : null;
+  const result = await electronDialog.showMessageBox(parent, {
+    type: "warning",
+    buttons: [t("confirm") || "Confirm", t("cancel") || "Cancel"],
+    defaultId: 1,
+    cancelId: 1,
+    title: t("dangerousConfirmTitle") || "Confirm Dangerous Mode",
+    message: t("dangerousConfirmMessage") || "Dangerous mode skips ALL permission checks.",
+  });
+  return result.response === 0;
+}
+
+// Await launchClaudeSession and surface failures instead of swallowing them:
+// show a localized error dialog so the user knows nothing happened, and log
+// for diagnosis. Never throws.
+async function runLaunchClaudeSession(t, mode, cwd, sessionId) {
+  let res;
+  try {
+    res = await launchClaudeSession(mode, cwd, sessionId);
+  } catch (err) {
+    console.error("[launch-claude] launch threw:", err);
+    res = { ok: false, message: (err && err.message) || String(err) };
+  }
+  if (res && res.ok) return res;
+  console.error("[launch-claude] launch failed:", res && res.message);
+  try {
+    const parent = win && !win.isDestroyed() ? win : null;
+    await electronDialog.showMessageBox(parent, {
+      type: "error",
+      buttons: [t("dismiss") || "OK"],
+      title: t("newSession") || "New Session",
+      message: t("launchFailed") || "Failed to launch Claude Code.",
+      detail: (res && res.message) || "",
+    });
+  } catch (err) {
+    console.error("[launch-claude] failed to show error dialog:", err);
+  }
+  return res;
+}
+
+function showResumeInput(t) {
+  return new Promise((resolve) => {
+    const inputWin = new BrowserWindow({
+      width: 420,
+      height: 180,
+      resizable: false,
+      alwaysOnTop: true,
+      frame: false,
+      transparent: true,
+      skipTaskbar: true,
+      parent: win && !win.isDestroyed() ? win : undefined,
+      modal: true,
+      webPreferences: { nodeIntegration: false, contextIsolation: true },
+    });
+    const title = t("resumeSessionTitle") || "Resume Session";
+    const hint = t("resumeSessionHint") || "Enter Session ID";
+    const confirmLabel = t("confirm") || "OK";
+    const cancelLabel = t("dismiss") || "Cancel";
+    const html = `<!DOCTYPE html><html><head><style>
+      *{margin:0;padding:0;box-sizing:border-box}
+      body{font-family:system-ui,-apple-system,sans-serif;background:#1e1e2e;color:#cdd6f4;display:flex;flex-direction:column;height:100vh;padding:16px;border-radius:12px;overflow:hidden}
+      .title{font-size:14px;font-weight:600;margin-bottom:12px}
+      input{width:100%;padding:8px 12px;border:1px solid #45475a;border-radius:6px;background:#313244;color:#cdd6f4;font-size:13px;outline:none}
+      input:focus{border-color:#89b4fa}
+      input::placeholder{color:#6c7086}
+      .btns{display:flex;gap:8px;margin-top:14px;justify-content:flex-end}
+      button{padding:6px 16px;border:none;border-radius:6px;font-size:12px;cursor:pointer}
+      .ok{background:#89b4fa;color:#1e1e2e;font-weight:600}
+      .cancel{background:#45475a;color:#cdd6f4}
+    </style></head><body>
+      <div class="title">${title}</div>
+      <input id="sid" type="text" placeholder="${hint}" autofocus />
+      <div class="btns">
+        <button class="cancel" onclick="result(null)">${cancelLabel}</button>
+        <button class="ok" onclick="result(document.getElementById('sid').value)">${confirmLabel}</button>
+      </div>
+      <script>
+        function result(v){window._resolve(v)}
+        document.getElementById('sid').addEventListener('keydown',e=>{
+          if(e.key==='Enter')result(document.getElementById('sid').value);
+          if(e.key==='Escape')result(null);
+        });
+      </script>
+    </body></html>`;
+    inputWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+    inputWin.webContents.on("did-finish-load", () => {
+      inputWin.webContents.executeJavaScript(
+        "new Promise(r=>{window._resolve=r})"
+      ).then((val) => {
+        const sessionId = typeof val === "string" ? val.trim() : "";
+        resolve(sessionId || null);
+        try { inputWin.close(); } catch {}
+      });
+    });
+    inputWin.on("closed", () => resolve(null));
+  });
+}
+
 const _menuCtx = {
   get win() { return win; },
   get sessions() { return sessions; },
@@ -1743,14 +2519,87 @@ const _menuCtx = {
   set contextMenu(v) { contextMenu = v; },
   enableDoNotDisturb: () => enableDoNotDisturb(),
   disableDoNotDisturb: () => disableDoNotDisturb(),
-  enterMiniViaMenu: () => enterMiniViaMenu(),
+  enterMiniViaMenu: () => {
+    if (!disableMiniModeCached) enterMiniViaMenu();
+  },
   exitMiniMode: () => exitMiniMode(),
+  getDisableMiniMode: () => disableMiniModeCached,
   getMiniMode: () => _mini.getMiniMode(),
   getMiniTransitioning: () => _mini.getMiniTransitioning(),
   miniHandleResize: (sizeKey) => _mini.handleResize(sizeKey),
   checkForUpdates: (...args) => checkForUpdates(...args),
   getUpdateMenuItem: () => getUpdateMenuItem(),
   openDashboard: () => showDashboard(),
+  launchClaudeSession: (mode, cwd, sessionId) => launchClaudeSession(mode, cwd, sessionId),
+  newSessionWithFolder: async (t) => {
+    const parent = win && !win.isDestroyed() ? win : null;
+    const result = await electronDialog.showOpenDialog(parent, {
+      title: t("selectFolder"),
+      properties: ["openDirectory"],
+    });
+    if (result.canceled || !result.filePaths.length) return;
+    const folder = result.filePaths[0];
+    const mode = await electronDialog.showMessageBox(parent, {
+      type: "question",
+      buttons: [t("newSessionNormal"), t("newSessionDangerous"), t("newSessionContinue"), t("newSessionResume"), t("dismiss")],
+      defaultId: 0,
+      cancelId: 4,
+      title: t("newSession"),
+      message: t("newSession"),
+      detail: folder,
+    });
+    if (mode.response === 4) return;
+    if (mode.response === 3) {
+      const sessionId = await showResumeInput(t);
+      if (!sessionId) return;
+      const resumeMode = await electronDialog.showMessageBox(parent, {
+        type: "question",
+        buttons: [t("modeNormal"), t("modeDangerous"), t("dismiss")],
+        defaultId: 0,
+        cancelId: 2,
+        title: t("newSessionResume"),
+        message: sessionId,
+      });
+      if (resumeMode.response === 2) return;
+      if (resumeMode.response === 1 && !(await confirmDangerousMode(t))) return;
+      await runLaunchClaudeSession(t, resumeMode.response === 1 ? "resume-dangerous" : "resume", folder, sessionId);
+      return;
+    }
+    if (mode.response === 1 && !(await confirmDangerousMode(t))) return;
+    const modes = ["normal", "dangerous", "continue"];
+    await runLaunchClaudeSession(t, modes[mode.response], folder);
+  },
+  newSessionInCurrentDir: async (t) => {
+    const parent = win && !win.isDestroyed() ? win : null;
+    const mode = await electronDialog.showMessageBox(parent, {
+      type: "question",
+      buttons: [t("newSessionNormal"), t("newSessionDangerous"), t("newSessionContinue"), t("newSessionResume"), t("dismiss")],
+      defaultId: 0,
+      cancelId: 4,
+      title: t("newSession"),
+      message: t("newSession"),
+    });
+    if (mode.response === 4) return;
+    if (mode.response === 3) {
+      const sessionId = await showResumeInput(t);
+      if (!sessionId) return;
+      const resumeMode = await electronDialog.showMessageBox(parent, {
+        type: "question",
+        buttons: [t("modeNormal"), t("modeDangerous"), t("dismiss")],
+        defaultId: 0,
+        cancelId: 2,
+        title: t("newSessionResume"),
+        message: sessionId,
+      });
+      if (resumeMode.response === 2) return;
+      if (resumeMode.response === 1 && !(await confirmDangerousMode(t))) return;
+      await runLaunchClaudeSession(t, resumeMode.response === 1 ? "resume-dangerous" : "resume", undefined, sessionId);
+      return;
+    }
+    if (mode.response === 1 && !(await confirmDangerousMode(t))) return;
+    const modes = ["normal", "dangerous", "continue"];
+    await runLaunchClaudeSession(t, modes[mode.response]);
+  },
   // The settings controller is the only writer of persisted prefs. Toggle
   // setters above route through it; resize/sendToDisplay use
   // flushRuntimeStateToPrefs to capture window bounds after movement.
@@ -1782,13 +2631,17 @@ const { t, buildContextMenu, buildTrayMenu, rebuildAllMenus, createTray,
 // ── Settings effect router ──
 const SETTINGS_MIRROR_SETTERS = {
   lang: (v) => { lang = v; }, size: (v) => { currentSize = v; }, showTray: (v) => { showTray = v; },
-  showDock: (v) => { showDock = v; }, manageClaudeHooksAutomatically: (v) => { manageClaudeHooksAutomatically = v; },
+  showDock: (v) => { showDock = v; if (macHideController) macHideController.noteManualChange(); }, manageClaudeHooksAutomatically: (v) => { manageClaudeHooksAutomatically = v; },
   autoStartWithClaude: (v) => { autoStartWithClaude = v; }, openAtLogin: (v) => { openAtLogin = v; },
   bubbleFollowPet: (v) => { bubbleFollowPet = v; }, sessionHudEnabled: (v) => { sessionHudEnabled = v; },
+  sessionHudShowStateLabels: (v) => { sessionHudShowStateLabels = v; },
   sessionHudShowElapsed: (v) => { sessionHudShowElapsed = v; }, sessionHudCleanupDetached: (v) => { sessionHudCleanupDetached = v; },
-  sessionHudAutoHide: (v) => { sessionHudAutoHide = v; }, sessionHudPinned: (v) => { sessionHudPinned = v; },
+  sessionHudPinned: (v) => { sessionHudPinned = v; },
+  sessionStaleMs: (v) => { sessionStaleMs = v; }, workingStaleMs: (v) => { workingStaleMs = v; },
+  detachedIdleStaleMs: (v) => { detachedIdleStaleMs = v; },
   soundMuted: (v) => { soundMuted = v; }, soundVolume: (v) => { soundVolume = v; }, lowPowerIdleMode: (v) => { lowPowerIdleMode = v; },
-  allowEdgePinning: (v) => { allowEdgePinningCached = v; }, keepSizeAcrossDisplays: (v) => { keepSizeAcrossDisplaysCached = v; },
+  keepAwakeWhileWorking: (v) => { keepAwakeWhileWorking = v; },
+  allowEdgePinning: (v) => { allowEdgePinningCached = v; }, disableMiniMode: (v) => { disableMiniModeCached = v; }, keepSizeAcrossDisplays: (v) => { keepSizeAcrossDisplaysCached = v; },
 };
 
 function updateSettingsMirrors(changes) { for (const [key, value] of Object.entries(changes)) if (SETTINGS_MIRROR_SETTERS[key]) SETTINGS_MIRROR_SETTERS[key](value); }
@@ -1824,13 +2677,37 @@ const settingsEffectRouter = createSettingsEffectRouter({
   refreshUpdateBubbleAutoClose: () => callRuntimeMethod(_updateBubble, "refreshAutoCloseForPolicy"),
   repositionFloatingBubbles,
   syncSessionHudVisibility: () => syncSessionHudVisibility(),
+  handleSessionHudPinnedChanged: (next) => {
+    if (_sessionHud && typeof _sessionHud.handlePinnedChanged === "function") {
+      _sessionHud.handlePinnedChanged(next);
+    }
+  },
   reclampPetAfterEdgePinningChange,
+  exitMiniMode: () => exitMiniMode(),
+  getMiniMode: () => _mini.getMiniMode(),
   rebuildAllMenus,
+  reconcilePowerSaveBlocker,
   logWarn: console.warn,
 });
 settingsEffectRouter.start();
 _settingsController.subscribeKey("tgApproval", () => {
+  if (suppressTelegramApprovalSidecarSync > 0) return;
   queueTelegramApprovalSidecarSync("settings");
+});
+_settingsController.subscribeKey("mobilePreviewEnabled", async (enabled) => {
+  if (enabled) {
+    if (!_lanWss) {
+      const { initMobilePreviewServer } = require("./network/mobile-preview-server");
+      _lanWss = initMobilePreviewServer({
+        sessions,
+        getSettingsSnapshot: () => _settingsController.getSnapshot(),
+        isEnabled: () => _settingsController.get("mobilePreviewEnabled") === true,
+      });
+    }
+    await _lanWss.start();
+  } else if (_lanWss) {
+    _lanWss.cleanup();
+  }
 });
 
 animationOverridesMain = createSettingsAnimationOverridesMain({
@@ -1866,9 +2743,44 @@ const _updaterCtx = {
   resolveDisplayState: () => resolveDisplayState(),
   getSvgOverride: (state) => getSvgOverride(state),
   resetSoundCooldown: () => resetSoundCooldown(),
+  // #329 scheduler / pending-state prefs IO. Reads go straight to the
+  // settingsController snapshot; writes go through applyUpdate so the
+  // single-writer architecture (settings-controller.js) is honored.
+  getUpdatePref: (key) => {
+    try { return _settingsController.get(key); } catch { return undefined; }
+  },
+  setUpdatePref: (key, value) => {
+    try { _settingsController.applyUpdate(key, value); } catch {}
+  },
 };
 const _updater = require("./updater")(_updaterCtx);
-const { setupAutoUpdater, checkForUpdates, getUpdateMenuItem, getUpdateMenuLabel } = _updater;
+const {
+  setupAutoUpdater,
+  checkForUpdates,
+  getUpdateMenuItem,
+  getUpdateMenuLabel,
+  reconcilePendingOnStartup,
+  onSilentModeExit: updaterOnSilentModeExit,
+  startUpdateScheduler,
+  stopUpdateScheduler,
+} = _updater;
+// Now that updater is constructed, point the forward hook at it.
+notifyUpdaterSilentExit = () => { try { updaterOnSilentModeExit(); } catch {} };
+
+// #329: react to the autoUpdateCheck toggle in real time so users see
+// the scheduler start/stop without restarting Clawd.
+try {
+  _settingsController.subscribeKey("autoUpdateCheck", (value) => {
+    try {
+      if (value === false) stopUpdateScheduler();
+      else startUpdateScheduler();
+    } catch (err) {
+      updateLog(`scheduler toggle failed: ${err && err.message}`);
+    }
+  });
+} catch (err) {
+  updateLog(`scheduler subscribeKey failed: ${err && err.message}`);
+}
 
 // ── Doctor tab IPC ──
 const { registerDoctorIpc } = require("./doctor-ipc");
@@ -1971,8 +2883,15 @@ registerSettingsIpc({
     ? hardwareBuddyAdapter.getStatus()
     : null),
   testHardwareBuddyApproval: () => sendHardwareBuddyTestApproval(),
+  getQuickCommandPresets: () => hardwareBuddyAdapter && typeof hardwareBuddyAdapter.getQuickCommandPresets === "function"
+    ? hardwareBuddyAdapter.getQuickCommandPresets()
+    : { enabled: false, presets: [] },
+  sendQuickCommand: (payload) => hardwareBuddyAdapter && typeof hardwareBuddyAdapter.createQuickCommand === "function"
+    ? hardwareBuddyAdapter.createQuickCommand(payload)
+    : { status: "error", code: "quick_commands_unavailable", message: "Quick Commands are unavailable" },
   checkForUpdates,
   aboutHeroSvgPath: path.join(__dirname, "..", "assets", "svg", "clawd-about-hero.svg"),
+  getLanWsServer: () => _lanWss,
 });
 
 registerSessionIpc({
@@ -1981,6 +2900,7 @@ registerSessionIpc({
   getI18n: () => getDashboardI18nPayload(),
   focusSession: (sessionId, options) => focusDashboardSession(sessionId, options),
   hideSession: (sessionId) => hideDashboardSession(sessionId),
+  ackSessionCompletion: (sessionId) => _state.ackSessionCompletion(sessionId),
   setSessionAlias: (payload) => _settingsController.applyCommand("setSessionAlias", payload),
   showDashboard: (options) => showDashboard(options),
   setSessionHudPinned: (value) => {
@@ -1995,6 +2915,7 @@ registerSessionIpc({
       console.warn("Clawd: failed to pin Session HUD:", result.message);
     }
   },
+  getLanWsServer: () => _lanWss,
 });
 
 function createWindow() {
@@ -2090,6 +3011,7 @@ function createWindow() {
     syncHitWin: () => syncHitWin(),
     isMiniMode: () => _mini.getMiniMode(),
     checkMiniModeSnap: () => checkMiniModeSnap(),
+    getDisableMiniMode: () => disableMiniModeCached,
     hasPetWindow: () => !!(win && !win.isDestroyed()),
     getPetWindowBounds: () => getPetWindowBounds(),
     getKeepSizeAcrossDisplays: () => keepSizeAcrossDisplaysCached,
@@ -2105,6 +3027,11 @@ function createWindow() {
     focusLog: (message) => focusLog(message),
     showDashboard: () => showDashboard(),
     focusSession: (sessionId, options) => focusDashboardSession(sessionId, options),
+    revealSessionHud: () => {
+      if (_sessionHud && typeof _sessionHud.revealFromPet === "function") {
+        _sessionHud.revealFromPet();
+      }
+    },
   });
 
   registerPermissionIpc({
@@ -2120,6 +3047,7 @@ function createWindow() {
   initFocusHelper();
   startMainTick();
   startHttpServer();
+  if (_settingsController.get("mobilePreviewEnabled") === true) _lanWss.start();
   startStaleCleanup();
   // Wait for renderer to be ready before sending initial state
   // If hooks arrived during startup, respect them instead of forcing idle
@@ -2183,6 +3111,7 @@ const _miniCtx = {
   get doNotDisturb() { return doNotDisturb; },
   set doNotDisturb(v) { doNotDisturb = v; },
   get currentState() { return _state.getCurrentState(); },
+  notifyUpdaterSilentExit: () => notifyUpdaterSilentExit(),
   SIZES,
   getCurrentPixelSize,
   getEffectiveCurrentPixelSize,
@@ -2234,7 +3163,7 @@ Object.defineProperties(this || {}, {}); // no-op placeholder
 
 // ── Auto-install VS Code / Cursor terminal-focus extension ──
 const EXT_ID = "clawd.clawd-terminal-focus";
-const EXT_VERSION = "0.1.0";
+const EXT_VERSION = "0.1.1";
 const EXT_DIR_NAME = `${EXT_ID}-${EXT_VERSION}`;
 
 function installTerminalFocusExtension() {
@@ -2318,6 +3247,19 @@ if (!gotTheLock) {
   }
 
   app.whenReady().then(() => {
+    // macOS: override the dock icon with a version padded to the macOS icon
+    // grid (~80.5% of the canvas, ~100px transparent margin per side) so the
+    // Dock tile matches neighbor apps. The build-time icon.png sits ~72.6%
+    // (looks small); the earlier full-bleed dock-icon.png looked oversized
+    // (issue #416). Source preserved at assets/source/dock-icon-fullbleed.png.
+    if (isMac && app.dock && _settingsController.get("showDock") !== false) {
+      try {
+        app.dock.setIcon(path.join(__dirname, "..", "assets", "dock-icon.png"));
+      } catch (_) {
+        // non-fatal: fall back to the bundled icon
+      }
+    }
+
     const protocolRegistered = codexPetMain.registerProtocolClient();
     if (process.argv.includes(REGISTER_PROTOCOL_DEV_ARG)) {
       console.log(`Clawd: clawd:// dev protocol registration ${protocolRegistered ? "succeeded" : "failed"}`);
@@ -2334,8 +3276,25 @@ if (!gotTheLock) {
     updateDebugLog = path.join(app.getPath("userData"), "update-debug.log");
     sessionDebugLog = path.join(app.getPath("userData"), "session-debug.log");
     focusDebugLog = path.join(app.getPath("userData"), "focus-debug.log");
-    queueTelegramApprovalSidecarSync("startup");
+    initTelegramMigrationController().catch((err) => {
+      console.warn("Clawd: migration controller init failed:", err && err.message);
+    });
     createWindow();
+    // macOS: bridge the OS app-hidden state (⌘H / Dock right-click → 隐藏) to the
+    // pet. Pet windows are setCanHide:NO, so the OS marks the app hidden but the
+    // windows refuse to vanish, and an inactive-app Dock Hide fires no
+    // did-resign-active — so we poll app.isHidden() and drive setPetHidden(). (#416)
+    if (isMac) {
+      macHideController = createMacHideController({
+        isMac,
+        app,
+        getShowDock: () => showDock,
+        isPetHidden: () => petWindowRuntime.isPetHidden(),
+        setPetHidden: (hidden) => petWindowRuntime.setPetHidden(hidden),
+      });
+      macHideController.start();
+      app.on("activate", () => { if (macHideController) macHideController.onActivate(); });
+    }
     if (shouldOpenSettingsWindowFromArgv(process.argv)) {
       settingsWindowRuntime.open();
     }
@@ -2368,10 +3327,18 @@ if (!gotTheLock) {
 
     // Auto-updater: setup event handlers (user triggers check via tray menu)
     setupAutoUpdater();
+    // #329: reconcile any stale pending-update entry (e.g. user installed
+    // out-of-band on macOS) and start the background scheduler. Both are
+    // safe in dev mode — reconcile is a no-op when nothing is pending,
+    // and startUpdateScheduler() short-circuits on !app.isPackaged.
+    try { reconcilePendingOnStartup(); } catch (err) { updateLog(`reconcile failed: ${err && err.message}`); }
+    try { startUpdateScheduler(); } catch (err) { updateLog(`scheduler start failed: ${err && err.message}`); }
   });
 
   app.on("before-quit", () => {
     isQuitting = true;
+    try { stopUpdateScheduler(); } catch {}
+    releasePowerSaveBlocker();
     flushRuntimeStateToPrefs();
     globalShortcut.unregisterAll();
     void settingsSizePreviewSession.cleanup();
@@ -2383,10 +3350,12 @@ if (!gotTheLock) {
     if (hardwareBuddyAdapter) hardwareBuddyAdapter.stop();
     _perm.cleanup();
     _server.cleanup();
+    if (_lanWss) _lanWss.cleanup();
     _updateBubble.cleanup();
     _state.cleanup();
     _tick.cleanup();
     _mini.cleanup();
+    if (macHideController) macHideController.stop();
     _sessionHud.cleanup();
     agentRuntime.cleanup();
     topmostRuntime.cleanup();

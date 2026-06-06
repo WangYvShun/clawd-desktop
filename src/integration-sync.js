@@ -107,6 +107,21 @@ function createIntegrationSyncRuntime(options = {}) {
     }
   }
 
+  function syncQwenHooks() {
+    try {
+      if (typeof ctx.syncQwenHooksImpl === "function") return ctx.syncQwenHooksImpl();
+      const { registerQwenCodeHooks } = require("../hooks/qwen-code-install.js");
+      const result = registerQwenCodeHooks({ silent: true });
+      if (result.added > 0 || result.updated > 0) {
+        console.log(`Clawd: synced Qwen hooks (added ${result.added}, updated ${result.updated})`);
+      }
+      return { status: "ok", ...result };
+    } catch (err) {
+      console.warn("Clawd: failed to sync Qwen hooks:", err.message);
+      return { status: "error", message: err && err.message ? err.message : "Failed to sync Qwen hooks" };
+    }
+  }
+
   function syncCodexHooks() {
     try {
       if (typeof ctx.syncCodexHooksImpl === "function") return ctx.syncCodexHooksImpl();
@@ -172,6 +187,21 @@ function createIntegrationSyncRuntime(options = {}) {
     } catch (err) {
       console.warn("Clawd: failed to sync Cursor hooks:", err.message);
       return { status: "error", message: err && err.message ? err.message : "Failed to sync Cursor hooks" };
+    }
+  }
+
+  function syncCopilotHooks() {
+    try {
+      if (typeof ctx.syncCopilotHooksImpl === "function") return ctx.syncCopilotHooksImpl();
+      const { registerCopilotHooks } = require("../hooks/copilot-install.js");
+      const { added, updated } = registerCopilotHooks({ silent: true });
+      if (added > 0 || updated > 0) {
+        console.log(`Clawd: synced Copilot hooks (added ${added}, updated ${updated})`);
+      }
+      return { status: "ok", added, updated };
+    } catch (err) {
+      console.warn("Clawd: failed to sync Copilot hooks:", err.message);
+      return { status: "error", message: err && err.message ? err.message : "Failed to sync Copilot hooks" };
     }
   }
 
@@ -267,18 +297,36 @@ function createIntegrationSyncRuntime(options = {}) {
     }
   }
 
+  function syncQoderHooks() {
+    try {
+      if (typeof ctx.syncQoderHooksImpl === "function") return ctx.syncQoderHooksImpl();
+      const { registerQoderHooks } = require("../hooks/qoder-install.js");
+      const { added, updated } = registerQoderHooks({ silent: true });
+      if (added > 0 || updated > 0) {
+        console.log(`Clawd: synced Qoder hooks (added ${added}, updated ${updated})`);
+      }
+      return { status: "ok", added, updated };
+    } catch (err) {
+      console.warn("Clawd: failed to sync Qoder hooks:", err.message);
+      return { status: "error", message: err && err.message ? err.message : "Failed to sync Qoder hooks" };
+    }
+  }
+
   const AGENT_INTEGRATION_SYNCERS = Object.freeze({
     "gemini-cli": syncGeminiHooks,
     "antigravity-cli": syncAntigravityHooks,
     "cursor-agent": syncCursorHooks,
+    "copilot-cli": syncCopilotHooks,
     codebuddy: syncCodeBuddyHooks,
     "kiro-cli": syncKiroHooks,
     "kimi-cli": syncKimiHooks,
+    "qwen-code": syncQwenHooks,
     codex: syncCodexHooks,
     opencode: syncOpencodePlugin,
     pi: syncPiExtension,
     openclaw: syncOpenClawPlugin,
     hermes: syncHermesPlugin,
+    qoder: syncQoderHooks,
   });
 
   const AGENT_INTEGRATION_REPAIRERS = Object.freeze({
@@ -332,14 +380,17 @@ function createIntegrationSyncRuntime(options = {}) {
     syncGeminiHooks,
     syncAntigravityHooks,
     syncCursorHooks,
+    syncCopilotHooks,
     syncCodeBuddyHooks,
     syncKiroHooks,
     syncKimiHooks,
+    syncQwenHooks,
     syncCodexHooks,
     syncOpencodePlugin,
     syncPiExtension,
     syncOpenClawPlugin,
     syncHermesPlugin,
+    syncQoderHooks,
     repairCodexHooks,
     repairOpenClawPlugin,
     syncIntegrationForAgent,

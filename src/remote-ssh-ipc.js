@@ -213,7 +213,13 @@ function registerRemoteSshIpc(options = {}) {
         }
         return { status: "ok" };
       }
-      return { status: "error", message: result.message, step: result.step };
+      return {
+        status: "error",
+        message: result.message,
+        step: result.step,
+        reason: result.reason || null,
+        hint: result.hint || null,
+      };
     } catch (err) {
       return { status: "error", message: (err && err.message) || "deploy threw" };
     }
@@ -226,9 +232,12 @@ function registerRemoteSshIpc(options = {}) {
   // Open Terminal is the same command path with a "general use" framing.
 
   function buildInteractiveSshArgs(profile) {
-    // interactive: true drops -T so the remote shell gets a proper pty.
-    // BatchMode=no overrides the BatchMode=yes from base opts via ssh's
-    // last-wins semantics, allowing host key prompts / passphrase entry.
+    // interactive: true uses SSH_INTERACTIVE_BASE_OPTS (empty) so there's no
+    // BatchMode=yes / ConnectTimeout / -T in the base. The explicit
+    // `-o BatchMode=no` here is the FIRST BatchMode token ssh sees and wins
+    // (ssh -o is first-wins; see buildSshArgs comment). That also beats a
+    // `BatchMode yes` in the user's ~/.ssh/config, since command-line -o
+    // precedes config file entries in the resolution order.
     return buildSshArgs(profile, {
       extraOpts: ["-o", "BatchMode=no"],
       interactive: true,

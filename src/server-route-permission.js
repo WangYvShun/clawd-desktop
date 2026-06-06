@@ -13,6 +13,7 @@ const {
   normalizeCodexPermissionToolInput,
   buildToolInputFingerprint,
 } = require("./server-permission-utils");
+const { resolveHookAgentId } = require("./server-agent-id");
 
 const MAX_PERMISSION_BODY_BYTES = 524288;
 
@@ -38,21 +39,38 @@ function shouldBypassOpencodeBubble(ctx) {
   return !ctx.isAgentPermissionsEnabled("opencode");
 }
 
-function shouldBypassPiBubble(ctx) {
-  if (!arePermissionBubblesEnabled(ctx)) return true;
-  if (typeof ctx.isAgentPermissionsEnabled !== "function") return false;
-  return !ctx.isAgentPermissionsEnabled("pi");
-}
-
 function shouldBypassCodexBubble(ctx) {
   if (!arePermissionBubblesEnabled(ctx)) return true;
   if (typeof ctx.isAgentPermissionsEnabled !== "function") return false;
   return !ctx.isAgentPermissionsEnabled("codex");
 }
 
+function shouldBypassQwenCodeBubble(ctx) {
+  if (!arePermissionBubblesEnabled(ctx)) return true;
+  if (typeof ctx.isAgentPermissionsEnabled !== "function") return false;
+  return !ctx.isAgentPermissionsEnabled("qwen-code");
+}
+
+function shouldBypassCopilotBubble(ctx) {
+  if (!arePermissionBubblesEnabled(ctx)) return true;
+  if (typeof ctx.isAgentPermissionsEnabled !== "function") return false;
+  return !ctx.isAgentPermissionsEnabled("copilot-cli");
+}
+
+function shouldBypassHermesBubble(ctx) {
+  if (!arePermissionBubblesEnabled(ctx)) return true;
+  if (typeof ctx.isAgentPermissionsEnabled !== "function") return false;
+  return !ctx.isAgentPermissionsEnabled("hermes");
+}
+
 function shouldInterceptCodexPermission(ctx) {
   if (typeof ctx.isCodexPermissionInterceptEnabled !== "function") return true;
   return ctx.isCodexPermissionInterceptEnabled();
+}
+
+function shouldMuteCodexNativeNotificationSound(ctx) {
+  if (typeof ctx.isCodexNativeNotificationSoundEnabled !== "function") return false;
+  return ctx.isCodexNativeNotificationSoundEnabled() === false;
 }
 
 function arePermissionBubblesEnabled(ctx) {
@@ -103,17 +121,100 @@ function buildCodexPermissionSessionOptions(data) {
   return options;
 }
 
+function buildQwenCodePermissionSessionOptions(data) {
+  const sourcePid = normalizePositiveInteger(data.source_pid);
+  const rawAgentPid = data.agent_pid ?? data.claude_pid ?? data.cursor_pid;
+  const agentPid = normalizePositiveInteger(rawAgentPid);
+  const pidChain = Array.isArray(data.pid_chain)
+    ? data.pid_chain.filter((n) => Number.isFinite(n) && n > 0).map((n) => Math.floor(n))
+    : null;
+  const options = { agentId: "qwen-code" };
+
+  if (sourcePid) options.sourcePid = sourcePid;
+  if (agentPid) options.agentPid = agentPid;
+  if (pidChain && pidChain.length) options.pidChain = pidChain;
+  const cwd = normalizeString(data.cwd);
+  const host = normalizeString(data.host);
+  const platform = normalizeString(data.platform);
+  const model = normalizeString(data.model);
+  if (cwd) options.cwd = cwd;
+  if (host) options.host = host;
+  if (platform) options.platform = platform;
+  if (model) options.model = model;
+  return options;
+}
+
+function buildCopilotPermissionSessionOptions(data) {
+  const sourcePid = normalizePositiveInteger(data.source_pid);
+  const agentPid = normalizePositiveInteger(data.agent_pid);
+  const pidChain = Array.isArray(data.pid_chain)
+    ? data.pid_chain.filter((n) => Number.isFinite(n) && n > 0).map((n) => Math.floor(n))
+    : null;
+  const options = { agentId: "copilot-cli" };
+
+  if (sourcePid) options.sourcePid = sourcePid;
+  if (agentPid) options.agentPid = agentPid;
+  if (pidChain && pidChain.length) options.pidChain = pidChain;
+  const cwd = normalizeString(data.cwd);
+  const host = normalizeString(data.host);
+  if (cwd) options.cwd = cwd;
+  if (host) options.host = host;
+  return options;
+}
+
+function buildHermesPermissionSessionOptions(data) {
+  const sourcePid = normalizePositiveInteger(data.source_pid);
+  const agentPid = normalizePositiveInteger(data.agent_pid);
+  const pidChain = Array.isArray(data.pid_chain)
+    ? data.pid_chain.filter((n) => Number.isFinite(n) && n > 0).map((n) => Math.floor(n))
+    : null;
+  const options = { agentId: "hermes" };
+
+  if (sourcePid) options.sourcePid = sourcePid;
+  if (agentPid) options.agentPid = agentPid;
+  if (pidChain && pidChain.length) options.pidChain = pidChain;
+  const cwd = normalizeString(data.cwd);
+  if (cwd) options.cwd = cwd;
+  const editor = normalizeString(data.editor);
+  if (editor) options.editor = editor;
+  return options;
+}
+
 function sendCodexPermissionNoDecision(res) {
   res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
   res.end();
 }
 
-function sendPiPermissionNoDecision(res) {
+function sendQwenCodePermissionNoDecision(res) {
   res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
   res.end();
 }
 
+function sendCopilotPermissionNoDecision(res) {
+  res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+  res.end();
+}
+
+function sendPiPermissionAllow(res) {
+  const responseBody = JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PermissionRequest",
+      decision: { behavior: "allow" },
+    },
+  });
+  res.writeHead(200, {
+    "Content-Type": "application/json",
+    [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID,
+  });
+  res.end(responseBody);
+}
+
 function sendAntigravityPermissionNoDecision(res) {
+  res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
+  res.end();
+}
+
+function sendHermesPermissionNoDecision(res) {
   res.writeHead(204, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
   res.end();
 }
@@ -177,6 +278,7 @@ function handlePermissionPost(req, res, options) {
       return;
     }
     const recordRequestHookEvent = createRequestHookRecorder(data, "permission");
+    const { agentId } = resolveHookAgentId(data);
 
     try {
       // ── opencode branch ──
@@ -191,7 +293,7 @@ function handlePermissionPost(req, res, options) {
       // HTTP response (fire-and-forget), so a generic HTTP deny would
       // leave the TUI hanging until timeout. Instead we route DND
       // through the same reverse bridge the plugin uses for replies.
-      if (data.agent_id === "opencode") {
+      if (agentId === "opencode") {
         res.writeHead(200, { [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID });
         res.end("ok");
 
@@ -300,7 +402,7 @@ function handlePermissionPost(req, res, options) {
       // permission.js / bubble-format.js are kept as intentional dead code so
       // a future Path C restoration (e.g. if agy ships a final-allow protocol
       // field) only needs to re-enable this entry point.
-      if (data.agent_id === "antigravity-cli") {
+      if (agentId === "antigravity-cli") {
         const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : "Unknown";
         if (ctx.doNotDisturb) {
           recordRequestHookEvent.droppedByDnd();
@@ -317,7 +419,7 @@ function handlePermissionPost(req, res, options) {
       // ── Codex official PermissionRequest branch ──
       // The hook is blocking, but fallback must be no-decision rather than
       // Deny: Codex will then continue to its native approval prompt.
-      if (data.agent_id === "codex") {
+      if (agentId === "codex") {
         const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : "Unknown";
         const rawInput = data.tool_input && typeof data.tool_input === "object" ? data.tool_input : {};
         const description = typeof data.tool_input_description === "string" && data.tool_input_description
@@ -348,7 +450,12 @@ function handlePermissionPost(req, res, options) {
         }
 
         if (!shouldInterceptCodexPermission(ctx)) {
-          ctx.updateSession(sessionId, "notification", "PermissionRequest", codexSessionOptions);
+          const nativeSessionOptions = { ...codexSessionOptions };
+          if (shouldMuteCodexNativeNotificationSound(ctx)) {
+            nativeSessionOptions.muteNotificationSound = true;
+          }
+          nativeSessionOptions.transientPermissionEvent = true;
+          ctx.updateSession(sessionId, "notification", "PermissionRequest", nativeSessionOptions);
           ctx.permLog(`codex native permission mode -> no decision, native prompt fallback (tool=${toolName})`);
           recordRequestHookEvent.accepted();
           sendCodexPermissionNoDecision(res);
@@ -416,41 +523,44 @@ function handlePermissionPost(req, res, options) {
         return;
       }
 
-      // ── Pi extension PermissionRequest branch ──
-      // Pi waits synchronously on tool_call handlers but has no native
-      // permission prompt. Any Clawd-side no-decision must therefore return
-      // promptly so the extension can call ctx.ui.confirm() in the terminal.
-      if (data.agent_id === "pi") {
-        const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : "unknown";
+      // ── Qwen Code PermissionRequest branch ──
+      // Qwen command hooks treat empty/no-decision output as "show native
+      // permission prompt". Keep every fallback as 204/no-decision so Clawd
+      // never denies tools on cleanup or disabled bubble paths.
+      if (agentId === "qwen-code") {
+        const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : "Unknown";
         const rawInput = data.tool_input && typeof data.tool_input === "object" ? data.tool_input : {};
         const toolInput = truncateDeep(rawInput);
-        const sessionId = typeof data.session_id === "string" && data.session_id ? data.session_id : "pi:default";
+        const sessionId = typeof data.session_id === "string" && data.session_id ? data.session_id : "qwen-code:default";
         const toolUseId = normalizeHookToolUseId(
           data.tool_use_id ?? data.toolUseId ?? data.toolUseID
         );
-        const toolInputFingerprint = buildToolInputFingerprint(rawInput);
+        const toolInputFingerprint = typeof data.tool_input_fingerprint === "string" && data.tool_input_fingerprint
+          ? data.tool_input_fingerprint
+          : buildToolInputFingerprint(rawInput);
+        const qwenSessionOptions = buildQwenCodePermissionSessionOptions(data);
 
         if (ctx.doNotDisturb) {
           recordRequestHookEvent.droppedByDnd();
-          ctx.permLog(`pi DND -> no decision, terminal fallback (tool=${toolName})`);
-          sendPiPermissionNoDecision(res);
+          ctx.permLog(`qwen DND -> no decision, native prompt fallback (tool=${toolName})`);
+          sendQwenCodePermissionNoDecision(res);
           return;
         }
 
-        if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled("pi")) {
+        if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled("qwen-code")) {
           recordRequestHookEvent.droppedByDisabled();
-          ctx.permLog(`pi disabled -> no decision, terminal fallback (tool=${toolName})`);
-          sendPiPermissionNoDecision(res);
+          ctx.permLog(`qwen disabled -> no decision, native prompt fallback (tool=${toolName})`);
+          sendQwenCodePermissionNoDecision(res);
           return;
         }
 
-        if (shouldBypassPiBubble(ctx)) {
+        if (shouldBypassQwenCodeBubble(ctx)) {
           recordRequestHookEvent.accepted();
           const reason = !arePermissionBubblesEnabled(ctx)
             ? "permission bubbles disabled"
-            : "pi bubbles disabled";
-          ctx.permLog(`${reason} -> no decision, terminal fallback (tool=${toolName})`);
-          sendPiPermissionNoDecision(res);
+            : "qwen bubbles disabled";
+          ctx.permLog(`${reason} -> no decision, native prompt fallback (tool=${toolName})`);
+          sendQwenCodePermissionNoDecision(res);
           return;
         }
 
@@ -467,32 +577,305 @@ function handlePermissionPost(req, res, options) {
           toolInputFingerprint,
           resolvedSuggestion: null,
           createdAt: Date.now(),
-          agentId: "pi",
-          isPi: true,
+          agentId: "qwen-code",
+          isQwenCode: true,
+          sourcePid: qwenSessionOptions.sourcePid || null,
+          cwd: qwenSessionOptions.cwd || "",
+          agentPid: qwenSessionOptions.agentPid || null,
+          pidChain: qwenSessionOptions.pidChain || null,
+          host: qwenSessionOptions.host || null,
+          platform: qwenSessionOptions.platform || null,
+          model: qwenSessionOptions.model || null,
         };
         const abortHandler = () => {
           if (res.writableFinished) return;
-          ctx.permLog("abortHandler fired (pi)");
+          ctx.permLog("abortHandler fired (qwen)");
           ctx.resolvePermissionEntry(permEntry, "no-decision", "Client disconnected");
         };
         permEntry.abortHandler = abortHandler;
         res.on("close", abortHandler);
 
         addPendingPermission(ctx, permEntry);
-        ctx.updateSession(sessionId, "notification", "PermissionRequest", { agentId: "pi" });
+        ctx.updateSession(sessionId, "notification", "PermissionRequest", qwenSessionOptions);
 
-        ctx.permLog(`pi showing bubble: tool=${toolName} session=${sessionId} stack=${ctx.pendingPermissions.length}`);
+        ctx.permLog(`qwen showing bubble: tool=${toolName} session=${sessionId} stack=${ctx.pendingPermissions.length}`);
         recordRequestHookEvent.accepted();
         try {
           ctx.showPermissionBubble(permEntry);
         } catch (bubbleErr) {
-          ctx.permLog(`pi bubble failed: ${bubbleErr && bubbleErr.message} -> no decision`);
-          removePendingPermission(ctx, permEntry, "pi-bubble-failed");
+          ctx.permLog(`qwen bubble failed: ${bubbleErr && bubbleErr.message} -> no decision`);
+          removePendingPermission(ctx, permEntry, "qwen-bubble-failed");
           if (permEntry.abortHandler) res.removeListener("close", permEntry.abortHandler);
-          sendPiPermissionNoDecision(res);
+          sendQwenCodePermissionNoDecision(res);
           return;
         }
         startRemoteApproval(ctx, permEntry);
+        return;
+      }
+
+      // ── Copilot CLI PermissionRequest branch ──
+      // Copilot command hooks treat empty stdout + exit 0 as "no decision,
+      // continue native flow" (Phase 0 §3, locked). Every Clawd path here
+      // either resolves through the bubble or returns 204 so the hook
+      // emits empty stdout and lets Copilot's native menu run. We must
+      // NOT route Copilot through the Claude/CodeBuddy branch below,
+      // which would emit hookSpecificOutput JSON that Copilot can't parse.
+      //
+      // Telegram remote approval is intentionally excluded in v1
+      // (plan §6, Phase 6 lifecycle table). Track follow-up after a
+      // safe human-readable summary format is designed for Copilot's
+      // tool-specific toolInput shapes (edit's full diff is the
+      // worst-case carrier and shouldn't be telegrammed verbatim).
+      if (agentId === "copilot-cli") {
+        const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : "Unknown";
+        const rawInput = data.tool_input && typeof data.tool_input === "object" ? data.tool_input : {};
+        const toolInput = truncateDeep(rawInput);
+        const sessionId = typeof data.session_id === "string" && data.session_id ? data.session_id : "copilot-cli:default";
+        const toolUseId = normalizeHookToolUseId(
+          data.tool_use_id ?? data.toolUseId ?? data.toolUseID
+        );
+        const toolInputFingerprint = typeof data.tool_input_fingerprint === "string" && data.tool_input_fingerprint
+          ? data.tool_input_fingerprint
+          : buildToolInputFingerprint(rawInput);
+        const copilotSessionOptions = buildCopilotPermissionSessionOptions(data);
+
+        if (ctx.doNotDisturb) {
+          recordRequestHookEvent.droppedByDnd();
+          ctx.permLog(`copilot DND -> no decision, native prompt fallback (tool=${toolName})`);
+          sendCopilotPermissionNoDecision(res);
+          return;
+        }
+
+        if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled("copilot-cli")) {
+          recordRequestHookEvent.droppedByDisabled();
+          ctx.permLog(`copilot disabled -> no decision, native prompt fallback (tool=${toolName})`);
+          sendCopilotPermissionNoDecision(res);
+          return;
+        }
+
+        if (shouldBypassCopilotBubble(ctx)) {
+          recordRequestHookEvent.accepted();
+          const reason = !arePermissionBubblesEnabled(ctx)
+            ? "permission bubbles disabled"
+            : "copilot bubbles disabled";
+          ctx.permLog(`${reason} -> no decision, native prompt fallback (tool=${toolName})`);
+          sendCopilotPermissionNoDecision(res);
+          return;
+        }
+
+        const permEntry = {
+          res,
+          abortHandler: null,
+          suggestions: [],
+          sessionId,
+          bubble: null,
+          hideTimer: null,
+          toolName,
+          toolInput,
+          toolUseId,
+          toolInputFingerprint,
+          resolvedSuggestion: null,
+          createdAt: Date.now(),
+          agentId: "copilot-cli",
+          isCopilotCli: true,
+          sourcePid: copilotSessionOptions.sourcePid || null,
+          cwd: copilotSessionOptions.cwd || "",
+          agentPid: copilotSessionOptions.agentPid || null,
+          pidChain: copilotSessionOptions.pidChain || null,
+          host: copilotSessionOptions.host || null,
+        };
+        // Closed connection => no-decision (NOT deny). Phase 0 §4.2:
+        // Copilot deadlocks if the hook gets killed; a defensive deny
+        // here would also surprise users by overriding native flow on
+        // transient errors. Native fallback is always safer.
+        const abortHandler = () => {
+          if (res.writableFinished) return;
+          ctx.permLog("abortHandler fired (copilot)");
+          ctx.resolvePermissionEntry(permEntry, "no-decision", "Client disconnected");
+        };
+        permEntry.abortHandler = abortHandler;
+        res.on("close", abortHandler);
+
+        addPendingPermission(ctx, permEntry);
+        ctx.updateSession(sessionId, "notification", "PermissionRequest", copilotSessionOptions);
+
+        ctx.permLog(`copilot showing bubble: tool=${toolName} session=${sessionId} stack=${ctx.pendingPermissions.length}`);
+        recordRequestHookEvent.accepted();
+        try {
+          ctx.showPermissionBubble(permEntry);
+        } catch (bubbleErr) {
+          ctx.permLog(`copilot bubble failed: ${bubbleErr && bubbleErr.message} -> no decision`);
+          removePendingPermission(ctx, permEntry, "copilot-bubble-failed");
+          if (permEntry.abortHandler) res.removeListener("close", permEntry.abortHandler);
+          sendCopilotPermissionNoDecision(res);
+          return;
+        }
+        // v1: no startRemoteApproval. Telegram remote approval requires
+        // a Copilot-aware safe summary formatter (see Phase 7 follow-up).
+        return;
+      }
+
+      // ── Pi extension legacy PermissionRequest branch ──
+      // Pi is state-only in Clawd. Current extensions never POST /permission.
+      // A pre-state-only managed extension may still be loaded in an existing
+      // Pi process, so return "allow" to preserve Pi's native YOLO behavior
+      // instead of turning Clawd fallback into a terminal confirmation prompt.
+      if (agentId === "pi") {
+        const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : "unknown";
+        if (ctx.doNotDisturb) {
+          recordRequestHookEvent.droppedByDnd();
+        } else if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled("pi")) {
+          recordRequestHookEvent.droppedByDisabled();
+        } else {
+          recordRequestHookEvent.accepted();
+        }
+        ctx.permLog(`pi state-only -> allow native YOLO fallback (tool=${toolName})`);
+        sendPiPermissionAllow(res);
+        return;
+      }
+
+      // ── Hermes Agent branch ──
+      // Blocking HTTP. Fallback is 204 (no-decision) so the Hermes plugin
+      // returns None and the tool executes via Hermes's native flow.
+      if (data.agent_id === "hermes") {
+        const toolName = typeof data.tool_name === "string" && data.tool_name ? data.tool_name : "Unknown";
+        const rawInput = data.tool_input && typeof data.tool_input === "object" ? data.tool_input : {};
+        const toolInput = truncateDeep(rawInput);
+        const sessionId = typeof data.session_id === "string" && data.session_id ? data.session_id : "hermes:default";
+        const toolUseId = normalizeHookToolUseId(
+          data.tool_use_id ?? data.toolUseId ?? data.toolUseID
+        );
+        const toolInputFingerprint = buildToolInputFingerprint(rawInput);
+
+        if (ctx.doNotDisturb) {
+          recordRequestHookEvent.droppedByDnd();
+          ctx.permLog(`hermes DND -> no decision, native fallback (tool=${toolName})`);
+          sendHermesPermissionNoDecision(res);
+          return;
+        }
+
+        if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled("hermes")) {
+          recordRequestHookEvent.droppedByDisabled();
+          ctx.permLog(`hermes disabled -> no decision, native fallback (tool=${toolName})`);
+          sendHermesPermissionNoDecision(res);
+          return;
+        }
+
+        if (shouldBypassHermesBubble(ctx)) {
+          recordRequestHookEvent.accepted();
+          const reason = !arePermissionBubblesEnabled(ctx)
+            ? "permission bubbles disabled"
+            : "hermes bubbles disabled";
+          ctx.permLog(`${reason} -> no decision, native fallback (tool=${toolName})`);
+          sendHermesPermissionNoDecision(res);
+          return;
+        }
+
+        const isElicitation = toolName === "clarify" || toolName === "AskUserQuestion";
+
+        if (isElicitation) {
+          const elicitationInput = normalizeElicitationToolInput(toolInput);
+          const hermesSessionOptions = buildHermesPermissionSessionOptions(data);
+          ctx.permLog(`HERMES ELICITATION: tool=${toolName} session=${sessionId}`);
+          ctx.updateSession(sessionId, "notification", "Elicitation", hermesSessionOptions);
+
+          const permEntry = {
+            res,
+            abortHandler: null,
+            suggestions: [],
+            sessionId,
+            bubble: null,
+            hideTimer: null,
+            toolName,
+            toolInput: elicitationInput,
+            toolUseId,
+            toolInputFingerprint,
+            resolvedSuggestion: null,
+            createdAt: Date.now(),
+            isElicitation: true,
+            isHermes: true,
+            agentId: "hermes",
+            cwd: hermesSessionOptions.cwd || "",
+            agentPid: hermesSessionOptions.agentPid || null,
+            sourcePid: hermesSessionOptions.sourcePid || null,
+            pidChain: hermesSessionOptions.pidChain || null,
+            editor: hermesSessionOptions.editor || null,
+          };
+          const abortHandler = () => {
+            if (res.writableFinished) return;
+            ctx.permLog("hermes abortHandler fired (elicitation)");
+            ctx.resolvePermissionEntry(permEntry, "no-decision", "Client disconnected");
+          };
+          permEntry.abortHandler = abortHandler;
+          res.on("close", abortHandler);
+          addPendingPermission(ctx, permEntry);
+          recordRequestHookEvent.accepted();
+          try {
+            ctx.showPermissionBubble(permEntry);
+          } catch (bubbleErr) {
+            ctx.permLog(`hermes elicitation bubble failed: ${bubbleErr && bubbleErr.message} -> no decision`);
+            removePendingPermission(ctx, permEntry, "hermes-elicitation-bubble-failed");
+            if (permEntry.abortHandler) res.removeListener("close", permEntry.abortHandler);
+            if (permEntry.autoCloseTimer) { clearTimeout(permEntry.autoCloseTimer); permEntry.autoCloseTimer = null; }
+            if (permEntry.hideTimer) { clearTimeout(permEntry.hideTimer); permEntry.hideTimer = null; }
+            if (permEntry.bubble && !permEntry.bubble.isDestroyed()) {
+              try { permEntry.bubble.destroy(); } catch {}
+            }
+            permEntry.bubble = null;
+            sendHermesPermissionNoDecision(res);
+          }
+          return;
+        }
+
+        // General permission request
+        const hermesSessionOptions = buildHermesPermissionSessionOptions(data);
+        ctx.permLog(`HERMES PERMISSION: tool=${toolName} session=${sessionId}`);
+        ctx.updateSession(sessionId, "notification", "PermissionRequest", hermesSessionOptions);
+
+        const permEntry = {
+          res,
+          abortHandler: null,
+          suggestions: [],
+          sessionId,
+          bubble: null,
+          hideTimer: null,
+          toolName,
+          toolInput,
+          toolUseId,
+          toolInputFingerprint,
+          resolvedSuggestion: null,
+          createdAt: Date.now(),
+          isHermes: true,
+          agentId: "hermes",
+          cwd: hermesSessionOptions.cwd || "",
+          agentPid: hermesSessionOptions.agentPid || null,
+          sourcePid: hermesSessionOptions.sourcePid || null,
+          pidChain: hermesSessionOptions.pidChain || null,
+          editor: hermesSessionOptions.editor || null,
+        };
+        const abortHandler = () => {
+          if (res.writableFinished) return;
+          ctx.permLog("hermes abortHandler fired");
+          ctx.resolvePermissionEntry(permEntry, "no-decision", "Client disconnected");
+        };
+        permEntry.abortHandler = abortHandler;
+        res.on("close", abortHandler);
+        addPendingPermission(ctx, permEntry);
+        recordRequestHookEvent.accepted();
+        try {
+          ctx.showPermissionBubble(permEntry);
+        } catch (bubbleErr) {
+          ctx.permLog(`hermes bubble failed: ${bubbleErr && bubbleErr.message} -> no decision`);
+          removePendingPermission(ctx, permEntry, "hermes-bubble-failed");
+          if (permEntry.abortHandler) res.removeListener("close", permEntry.abortHandler);
+          if (permEntry.autoCloseTimer) { clearTimeout(permEntry.autoCloseTimer); permEntry.autoCloseTimer = null; }
+          if (permEntry.hideTimer) { clearTimeout(permEntry.hideTimer); permEntry.hideTimer = null; }
+          if (permEntry.bubble && !permEntry.bubble.isDestroyed()) {
+            try { permEntry.bubble.destroy(); } catch {}
+          }
+          permEntry.bubble = null;
+          sendHermesPermissionNoDecision(res);
+        }
         return;
       }
 
@@ -513,7 +896,7 @@ function handlePermissionPost(req, res, options) {
       // codebuddy, since they share this path) falls back to its built-in
       // chat prompt. Any non-opencode agent_id passing through here
       // gets the same treatment.
-      const ccAgentId = typeof data.agent_id === "string" && data.agent_id ? data.agent_id : "claude-code";
+      const ccAgentId = agentId;
       if (typeof ctx.isAgentEnabled === "function" && !ctx.isAgentEnabled(ccAgentId)) {
         recordRequestHookEvent.droppedByDisabled();
         ctx.permLog(`${ccAgentId} disabled → destroy connection, chat fallback`);
@@ -534,7 +917,7 @@ function handlePermissionPost(req, res, options) {
       // capabilities.permissionApproval=true and POST here). Stamping lets
       // dismissPermissionsByAgent() clean up the right ones when the user
       // disables an agent mid-flight.
-      const permAgentId = typeof data.agent_id === "string" && data.agent_id ? data.agent_id : "claude-code";
+      const permAgentId = agentId;
       const rawSuggestions = Array.isArray(data.permission_suggestions) ? data.permission_suggestions : [];
       const suggestions = normalizePermissionSuggestions(rawSuggestions);
 
@@ -649,7 +1032,7 @@ function handlePermissionPost(req, res, options) {
       try {
         ctx.showPermissionBubble(permEntry);
       } catch (bubbleErr) {
-        // Mirror the Codex/Pi branches: a BrowserWindow construction failure
+        // Mirror the Codex branch: a BrowserWindow construction failure
         // here would leave a ghost permEntry in pendingPermissions because
         // abortHandler only fires on res close. Pop the entry explicitly and
         // destroy the socket so CC falls back to its built-in chat prompt
@@ -687,12 +1070,18 @@ module.exports = {
   MAX_PERMISSION_BODY_BYTES,
   shouldBypassCCBubble,
   shouldBypassCodexBubble,
+  shouldBypassQwenCodeBubble,
+  shouldBypassCopilotBubble,
   shouldBypassOpencodeBubble,
-  shouldBypassPiBubble,
   arePermissionBubblesEnabled,
   shouldInterceptCodexPermission,
+  shouldMuteCodexNativeNotificationSound,
   sendCodexPermissionNoDecision,
-  sendPiPermissionNoDecision,
+  sendQwenCodePermissionNoDecision,
+  sendCopilotPermissionNoDecision,
+  sendPiPermissionAllow,
   sendAntigravityPermissionNoDecision,
+  sendHermesPermissionNoDecision,
+  shouldBypassHermesBubble,
   handlePermissionPost,
 };

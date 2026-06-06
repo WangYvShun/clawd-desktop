@@ -1,5 +1,6 @@
 "use strict";
 
+const fs = require("fs");
 const path = require("path");
 const {
   normalizeHardwareBuddySettings,
@@ -20,6 +21,201 @@ function isEnabledFromEnv(env = process.env) {
   return false;
 }
 
+const FALLBACK_QUICK_COMMAND_PRESETS = Object.freeze([
+  Object.freeze({ id: "continue", label: "\u7ee7\u7eed" }),
+  Object.freeze({ id: "correct", label: "\u4e0d\u662f\u8fd9\u6837\u7684" }),
+  Object.freeze({ id: "no_commit", label: "\u4e0d\u8981 commit" }),
+  Object.freeze({ id: "no_source_edits", label: "\u4e0d\u8981\u6539\u6e90\u6587\u4ef6" }),
+  Object.freeze({ id: "show_diff", label: "show diff" }),
+  Object.freeze({ id: "plain_language", label: "\u8bf4\u4eba\u8bdd" }),
+  Object.freeze({ id: "plan_first", label: "\u5148\u5217\u8ba1\u5212" }),
+]);
+const FALLBACK_QUICK_COMMAND_PRESET_BY_ID = new Map(
+  FALLBACK_QUICK_COMMAND_PRESETS.map((preset) => [preset.id, preset])
+);
+const FALLBACK_CONSTRAINT_COMMANDS = new Set(["no_commit", "no_source_edits"]);
+const FALLBACK_QUICK_COMMAND_SOURCES = new Set(["tray", "hardware", "http", "cli", "test"]);
+
+function quickCommandError(code, message) {
+  return Object.assign(new Error(message), { code, statusCode: 400 });
+}
+
+function cloneQuickCommandPreset(preset) {
+  return { id: preset.id, label: preset.label };
+}
+
+function normalizeQuickCommandString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeFallbackQuickCommand(input = {}) {
+  const object = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const preset = FALLBACK_QUICK_COMMAND_PRESET_BY_ID.get(normalizeQuickCommandString(object.id));
+  if (!preset) {
+    throw quickCommandError(
+      "invalid_quick_command",
+      `unknown quick command preset: ${normalizeQuickCommandString(object.id) || "<empty>"}`
+    );
+  }
+  const clientRequestId = normalizeQuickCommandString(object.clientRequestId);
+  if (!clientRequestId) {
+    throw quickCommandError("missing_client_request_id", "clientRequestId is required");
+  }
+  const targetInput = object.target && typeof object.target === "object" && !Array.isArray(object.target)
+    ? object.target
+    : { scope: object.scope, sessionId: object.sessionId };
+  const scope = normalizeQuickCommandString(targetInput.scope) || "active_session";
+  if (scope !== "active_session") {
+    throw quickCommandError("invalid_quick_command_target", "quick command target.scope must be active_session");
+  }
+  const duration = normalizeQuickCommandString(object.duration);
+  if (FALLBACK_CONSTRAINT_COMMANDS.has(preset.id)) {
+    if (duration && duration !== "next_turn") {
+      throw quickCommandError("invalid_quick_command_duration", "constraint quick command duration must be next_turn");
+    }
+  } else if (duration) {
+    throw quickCommandError("invalid_quick_command_duration", "message quick command duration must be null");
+  }
+  const source = normalizeQuickCommandString(object.source).toLowerCase();
+  const sessionId = normalizeQuickCommandString(targetInput.sessionId) || null;
+  return {
+    type: "quick_command",
+    version: 1,
+    id: preset.id,
+    label: preset.label,
+    target: {
+      scope: "active_session",
+      sessionId,
+      resolution: sessionId ? "client_provided" : "defer_to_adapter",
+    },
+    duration: FALLBACK_CONSTRAINT_COMMANDS.has(preset.id) ? (duration || "next_turn") : null,
+    source: FALLBACK_QUICK_COMMAND_SOURCES.has(source) ? source : "unknown",
+    clientRequestId,
+    userText: object.userText == null ? null : (normalizeQuickCommandString(object.userText) || null),
+  };
+}
+
+function sanitizeUnicodeScalarString(value) {
+  if (typeof value !== "string") return value;
+  let changed = false;
+  let out = "";
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = i + 1 < value.length ? value.charCodeAt(i + 1) : 0;
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += value[i] + value[i + 1];
+        i += 1;
+      } else {
+        out += "\ufffd";
+        changed = true;
+      }
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      out += "\ufffd";
+      changed = true;
+    } else {
+      out += value[i];
+    }
+  }
+  return changed ? out : value;
+}
+
+function sanitizeHardwareBuddyPayload(value, seen = new WeakMap()) {
+  if (typeof value === "string") return sanitizeUnicodeScalarString(value);
+  if (!value || typeof value !== "object") return value;
+  if (seen.has(value)) return seen.get(value);
+
+  if (Array.isArray(value)) {
+    const out = [];
+    seen.set(value, out);
+    for (const item of value) out.push(sanitizeHardwareBuddyPayload(item, seen));
+    return out;
+  }
+
+  const out = {};
+  seen.set(value, out);
+  for (const [key, item] of Object.entries(value)) {
+    out[key] = sanitizeHardwareBuddyPayload(item, seen);
+  }
+  return out;
+}
+
+function wrapHardwareBuddyTransport(transport) {
+  if (!transport || typeof transport.send !== "function" || transport.__clawdSanitizedSend === true) return transport;
+  const rawSend = transport.send.bind(transport);
+  transport.send = (snapshot, meta) => rawSend(sanitizeHardwareBuddyPayload(snapshot), meta);
+  Object.defineProperty(transport, "__clawdSanitizedSend", {
+    value: true,
+    enumerable: false,
+  });
+  return transport;
+}
+
+class FallbackMemoryQuickCommandSink {
+  constructor(options = {}) {
+    this.maxRecords = Math.max(1, Math.floor(Number(options.maxRecords || 100)));
+    this.dedupeMs = Math.max(0, Math.floor(Number(options.dedupeMs || 30000)));
+    this.now = typeof options.now === "function" ? options.now : () => Date.now();
+    this.records = [];
+    this.nextSeq = 1;
+    this.dedupe = new Map();
+  }
+
+  write(input = {}) {
+    const now = this.now();
+    for (const [key, entry] of this.dedupe.entries()) {
+      if (!entry || entry.expiresAt <= now) this.dedupe.delete(key);
+    }
+    const normalized = normalizeFallbackQuickCommand(input);
+    const existing = this.dedupeMs > 0 ? this.dedupe.get(normalized.clientRequestId) : null;
+    if (existing && existing.expiresAt > now) {
+      return { record: existing.record, duplicate: true };
+    }
+    const record = { seq: this.nextSeq, ...normalized, createdAt: now };
+    this.nextSeq += 1;
+    this.records.push(record);
+    if (this.records.length > this.maxRecords) {
+      this.records.splice(0, this.records.length - this.maxRecords);
+    }
+    if (this.dedupeMs > 0) {
+      this.dedupe.set(record.clientRequestId, { record, expiresAt: now + this.dedupeMs });
+    }
+    return { record, duplicate: false };
+  }
+
+  list(options = {}) {
+    const after = Math.max(0, Math.floor(Number(options.after || 0)));
+    const limit = Math.max(1, Math.min(this.maxRecords, Math.floor(Number(options.limit || this.maxRecords))));
+    const available = this.records.filter((record) => record.seq > after);
+    const items = available.slice(0, limit);
+    return {
+      cursor: after,
+      nextCursor: items.length ? items[items.length - 1].seq : after,
+      latestSeq: this.records.length ? this.records[this.records.length - 1].seq : 0,
+      oldestSeq: this.records.length ? this.records[0].seq : 0,
+      hasMore: available.length > items.length,
+      items,
+    };
+  }
+
+  status() {
+    return {
+      type: "memory",
+      size: this.records.length,
+      maxRecords: this.maxRecords,
+      dedupeMs: this.dedupeMs,
+      nextSeq: this.nextSeq,
+      oldestSeq: this.records.length ? this.records[0].seq : 0,
+      latestSeq: this.records.length ? this.records[this.records.length - 1].seq : 0,
+    };
+  }
+
+  stop() {
+    this.records = [];
+    this.dedupe.clear();
+  }
+}
+
 function numberFromEnv(value, fallback) {
   const n = Number(value);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
@@ -27,16 +223,42 @@ function numberFromEnv(value, fallback) {
 
 function defaultCoreRoot(env = process.env) {
   return env.CLAWD_HARDWARE_BUDDY_ROOT
-    || path.resolve(__dirname, "..", "..", "ClaudeBuddy");
+    || path.resolve(__dirname, "..", "..", "clawstick");
 }
 
 function loadCoreModules(coreRoot) {
   const controllerPath = path.join(coreRoot, "src", "hardware-buddy", "controller.js");
   const sidecarPath = path.join(coreRoot, "src", "hardware-buddy", "sidecar-client.js");
+  const missingPaths = [controllerPath, sidecarPath].filter((p) => !fs.existsSync(p));
+  if (missingPaths.length) {
+    const err = new Error(
+      "Hardware Buddy core modules are missing. Clone https://github.com/rullerzhou-afk/clawstick next to this repo or set CLAWD_HARDWARE_BUDDY_ROOT."
+    );
+    err.code = "CORE_MISSING";
+    err.coreRoot = coreRoot;
+    err.missingPaths = missingPaths;
+    throw err;
+  }
   return {
     HardwareBuddyController: require(controllerPath).HardwareBuddyController,
     SidecarClient: require(sidecarPath).SidecarClient,
   };
+}
+
+function loadQuickCommandModules(coreRoot) {
+  try {
+    const presets = require(path.join(coreRoot, "src", "runtime", "quick-command-presets.js"));
+    const sink = require(path.join(coreRoot, "src", "runtime", "memory-quick-command-sink.js"));
+    return {
+      QUICK_COMMAND_PRESETS: presets.QUICK_COMMAND_PRESETS,
+      createMemoryQuickCommandSink: sink.createMemoryQuickCommandSink,
+    };
+  } catch {
+    return {
+      QUICK_COMMAND_PRESETS: FALLBACK_QUICK_COMMAND_PRESETS,
+      createMemoryQuickCommandSink: (options) => new FallbackMemoryQuickCommandSink(options),
+    };
+  }
 }
 
 function defaultSidecarScript(coreRoot, env = process.env) {
@@ -62,6 +284,14 @@ function readRuntimeConfig(options, env = process.env) {
 
   if (options.permissionsEnabled != null) config.permissionsEnabled = !!options.permissionsEnabled;
   else if (truthy(env.CLAWD_HARDWARE_BUDDY_PERMISSIONS)) config.permissionsEnabled = true;
+
+  if (options.quickCommandsEnabled != null) config.quickCommandsEnabled = !!options.quickCommandsEnabled;
+  else if (truthy(env.CLAWD_HARDWARE_BUDDY_QUICK_COMMANDS) || truthy(env.CLAWD_QUICK_COMMANDS)) {
+    config.quickCommandsEnabled = true;
+  }
+  if (truthy(env.CLAWD_HARDWARE_BUDDY_QUICK_COMMANDS_DISABLED) || truthy(env.CLAWD_QUICK_COMMANDS_DISABLED)) {
+    config.quickCommandsEnabled = false;
+  }
 
   if (env.CLAWD_HARDWARE_BUDDY_BACKEND) config.backend = env.CLAWD_HARDWARE_BUDDY_BACKEND;
   if (env.CLAWD_HARDWARE_BUDDY_ADDRESS) config.address = String(env.CLAWD_HARDWARE_BUDDY_ADDRESS).trim();
@@ -102,6 +332,22 @@ function buildSidecarArgs(options) {
   return args;
 }
 
+function buildSidecarSpawnOptions(options = {}, env = process.env) {
+  const source = options.spawnOptions && typeof options.spawnOptions === "object"
+    ? { ...options.spawnOptions }
+    : {};
+  const sourceEnv = source.env && typeof source.env === "object" ? source.env : {};
+  return {
+    ...source,
+    env: {
+      ...process.env,
+      ...(env || {}),
+      ...sourceEnv,
+      PYTHONIOENCODING: "utf-8:replace",
+    },
+  };
+}
+
 function callSafely(fn, log) {
   try {
     return fn();
@@ -124,13 +370,13 @@ function classifyHardwareBuddyIssue(err) {
       hint: "Install the Hardware Buddy sidecar requirements.",
     };
   }
-  if (code === "AUTH_REQUIRED") {
+  if (code === "AUTH_REQUIRED" || looksLikeUserCanceledBlePrompt(message, lower)) {
     return {
-      code,
+      code: code === "AUTH_REQUIRED" ? code : "AUTH_REQUIRED",
       category: "auth_required",
       retryable: true,
-      message: message || "BLE pairing is required",
-      hint: "Pair the device in Windows Bluetooth settings.",
+      message: message || "BLE pairing or connection approval is required",
+      hint: "Pair the device in Windows Bluetooth settings and accept the connection prompt.",
     };
   }
   if (code === "NO_DEVICE" || lower.includes("device not found")) {
@@ -169,6 +415,15 @@ function classifyHardwareBuddyIssue(err) {
       hint: "Check the Hardware Buddy settings.",
     };
   }
+  if (code === "CORE_MISSING") {
+    return {
+      code,
+      category: "core_missing",
+      retryable: false,
+      message: message || "Hardware Buddy core modules are missing",
+      hint: "Clone https://github.com/rullerzhou-afk/clawstick next to this repo or set CLAWD_HARDWARE_BUDDY_ROOT.",
+    };
+  }
   if (code === "SIDECAR_EXIT") {
     return {
       code,
@@ -187,6 +442,16 @@ function classifyHardwareBuddyIssue(err) {
   };
 }
 
+function looksLikeUserCanceledBlePrompt(message, lower = String(message || "").toLowerCase()) {
+  if (!message) return false;
+  return lower.includes("winerror -2147023673")
+    || lower.includes("operation was canceled")
+    || lower.includes("operation was cancelled")
+    || lower.includes("user canceled")
+    || lower.includes("user cancelled")
+    || message.includes("\u64cd\u4f5c\u5df2\u88ab\u7528\u6237\u53d6\u6d88");
+}
+
 function createHardwareBuddyAdapter(options = {}) {
   const env = options.env || process.env;
   const log = typeof options.log === "function" ? options.log : () => {};
@@ -195,6 +460,8 @@ function createHardwareBuddyAdapter(options = {}) {
   const autoConnectDelayMs = numberFromEnv(env.CLAWD_HARDWARE_BUDDY_CONNECT_DELAY_MS, 1000);
   const autoConnectRetryMs = numberFromEnv(env.CLAWD_HARDWARE_BUDDY_CONNECT_RETRY_MS, 15000);
   const autoConnectRetryMaxMs = numberFromEnv(env.CLAWD_HARDWARE_BUDDY_CONNECT_RETRY_MAX_MS, 120000);
+  const quickCommandBufferSize = numberFromEnv(env.CLAWD_HARDWARE_BUDDY_QUICK_COMMAND_BUFFER_SIZE, 100);
+  const quickCommandDedupeMs = numberFromEnv(env.CLAWD_HARDWARE_BUDDY_QUICK_COMMAND_DEDUPE_MS, 30000);
   const notifyDebounceMs = options.notifyDebounceMs != null
     ? numberFromEnv(options.notifyDebounceMs, 50)
     : numberFromEnv(env.CLAWD_HARDWARE_BUDDY_NOTIFY_DEBOUNCE_MS, 50);
@@ -212,6 +479,8 @@ function createHardwareBuddyAdapter(options = {}) {
   let autoConnectTimer = null;
   let restartTimer = null;
   let stateNotifyTimer = null;
+  let quickCommandSink = null;
+  let quickCommandModules = null;
   let lastStatus = null;
   let lastDevices = [];
   let activeConfig = readRuntimeConfig(options, env);
@@ -231,6 +500,12 @@ function createHardwareBuddyAdapter(options = {}) {
       address: activeConfig.address,
       namePrefix: activeConfig.namePrefix,
       permissionsEnabled: activeConfig.permissionsEnabled === true,
+      quickCommands: {
+        enabled: activeConfig.quickCommandsEnabled === true,
+        sink: quickCommandSink && typeof quickCommandSink.status === "function"
+          ? quickCommandSink.status()
+          : { type: "none" },
+      },
       connected,
       secure,
       lastStatus,
@@ -252,6 +527,121 @@ function createHardwareBuddyAdapter(options = {}) {
     if (ts - prev < logThrottleMs) return;
     lastLogAt.set(key, ts);
     log(message, meta);
+  }
+
+  function getQuickCommandModules() {
+    if (quickCommandModules) return quickCommandModules;
+    if (options.quickCommandModules && typeof options.quickCommandModules === "object") {
+      quickCommandModules = options.quickCommandModules;
+    } else {
+      quickCommandModules = loadQuickCommandModules(coreRoot);
+    }
+    if (!Array.isArray(quickCommandModules.QUICK_COMMAND_PRESETS)) {
+      quickCommandModules.QUICK_COMMAND_PRESETS = FALLBACK_QUICK_COMMAND_PRESETS;
+    }
+    if (typeof quickCommandModules.createMemoryQuickCommandSink !== "function") {
+      quickCommandModules.createMemoryQuickCommandSink = (sinkOptions) => new FallbackMemoryQuickCommandSink(sinkOptions);
+    }
+    return quickCommandModules;
+  }
+
+  function getQuickCommandPresets() {
+    const modules = getQuickCommandModules();
+    return {
+      enabled: activeConfig.quickCommandsEnabled === true,
+      presets: modules.QUICK_COMMAND_PRESETS.map(cloneQuickCommandPreset),
+    };
+  }
+
+  function ensureQuickCommandSink() {
+    if (activeConfig.quickCommandsEnabled !== true) return null;
+    if (!quickCommandSink) {
+      const modules = getQuickCommandModules();
+      quickCommandSink = modules.createMemoryQuickCommandSink({
+        maxRecords: quickCommandBufferSize,
+        quickCommandBufferSize,
+        dedupeMs: quickCommandDedupeMs,
+        quickCommandDedupeMs,
+        now,
+        log: (_level, message) => log(`quick-command: ${message}`),
+      });
+    }
+    return quickCommandSink;
+  }
+
+  function stopQuickCommandSink() {
+    if (quickCommandSink && typeof quickCommandSink.stop === "function") {
+      try {
+        quickCommandSink.stop();
+      } catch (err) {
+        log(`quick-command stop failed: ${err && err.message ? err.message : err}`);
+      }
+    }
+    quickCommandSink = null;
+  }
+
+  function syncQuickCommandSink() {
+    if (activeConfig.quickCommandsEnabled === true) {
+      ensureQuickCommandSink();
+    } else {
+      stopQuickCommandSink();
+    }
+  }
+
+  function createQuickCommand(input = {}) {
+    if (activeConfig.quickCommandsEnabled !== true) {
+      return {
+        status: "error",
+        code: "quick_commands_disabled",
+        message: "Quick Commands are disabled.",
+      };
+    }
+    const sink = ensureQuickCommandSink();
+    if (!sink || typeof sink.write !== "function") {
+      return {
+        status: "error",
+        code: "quick_commands_unavailable",
+        message: "Quick Commands are not configured.",
+      };
+    }
+    try {
+      const result = sink.write(input);
+      publishStatus();
+      return {
+        status: "ok",
+        quickCommand: result && result.record ? result.record : null,
+        duplicate: !!(result && result.duplicate),
+      };
+    } catch (err) {
+      return {
+        status: "error",
+        code: (err && err.code) || "quick_command_error",
+        message: err && err.message ? err.message : String(err),
+      };
+    }
+  }
+
+  function listQuickCommands(options = {}) {
+    if (activeConfig.quickCommandsEnabled !== true) {
+      return {
+        cursor: 0,
+        nextCursor: 0,
+        latestSeq: 0,
+        oldestSeq: 0,
+        hasMore: false,
+        items: [],
+      };
+    }
+    const sink = ensureQuickCommandSink();
+    if (sink && typeof sink.list === "function") return sink.list(options);
+    return {
+      cursor: 0,
+      nextCursor: 0,
+      latestSeq: 0,
+      oldestSeq: 0,
+      hasMore: false,
+      items: [],
+    };
   }
 
   function clearAutoConnectTimer() {
@@ -330,9 +720,11 @@ function createHardwareBuddyAdapter(options = {}) {
     throttledLog(`issue:${issue.category}:${issue.code}`, `sidecar ${issue.category}: ${issue.message}`, err);
     const delay = retryDelay(issue);
     publishStatus({ retryDelayMs: delay || 0, nextRetryAt: delay ? now() + delay : null });
+    if (issue.category === "core_missing") return issue;
     if (!delay) return;
     if (restart) scheduleRestart(delay);
     else scheduleAutoConnect(delay);
+    return issue;
   }
 
   function clearStateNotifyTimer() {
@@ -402,6 +794,7 @@ function createHardwareBuddyAdapter(options = {}) {
     return new SidecarClient({
       command: options.command || env.CLAWD_HARDWARE_BUDDY_PYTHON || "python",
       args: options.args || buildSidecarArgs({ env, coreRoot, config: activeConfig }),
+      spawnOptions: buildSidecarSpawnOptions(options, env),
       log: (level, message, meta) => {
         if (/^sidecar exited\b/.test(String(message || ""))) {
           handleIssue({ code: "SIDECAR_EXIT", message }, { restart: true });
@@ -478,6 +871,7 @@ function createHardwareBuddyAdapter(options = {}) {
   function start() {
     if (started) return true;
     activeConfig = readRuntimeConfig(options, env);
+    syncQuickCommandSink();
     if (!activeConfig.enabled) {
       publishStatus();
       return false;
@@ -495,6 +889,7 @@ function createHardwareBuddyAdapter(options = {}) {
       }
 
       sidecar = createSidecar(SidecarClient);
+      wrapHardwareBuddyTransport(sidecar && sidecar.transport);
       controller = createController(HardwareBuddyController);
 
       sidecar.start();
@@ -502,7 +897,8 @@ function createHardwareBuddyAdapter(options = {}) {
       started = true;
     } catch (err) {
       cleanupStartedParts({ keepConfig: true });
-      handleIssue(err, { restart: true });
+      const issue = handleIssue(err, { restart: true });
+      if (issue && issue.category === "core_missing") return false;
       throw err;
     }
     log(`started backend=${activeConfig.backend} permissions=${activeConfig.permissionsEnabled ? "on" : "off"}`);
@@ -516,6 +912,8 @@ function createHardwareBuddyAdapter(options = {}) {
 
   function stop() {
     cleanupStartedParts();
+    stopQuickCommandSink();
+    publishStatus();
   }
 
   function applySettingsChange(nextSettings) {
@@ -530,12 +928,14 @@ function createHardwareBuddyAdapter(options = {}) {
       || previous.address !== next.address
       || previous.namePrefix !== next.namePrefix;
     const permissionChanged = previous.permissionsEnabled !== next.permissionsEnabled;
+    const quickCommandChanged = previous.quickCommandsEnabled !== next.quickCommandsEnabled;
     activeConfig = next;
+    if (quickCommandChanged) syncQuickCommandSink();
 
     if (!next.enabled) {
       if (started) cleanupStartedParts({ keepConfig: true });
       publishStatus();
-      return false;
+      return next.quickCommandsEnabled === true;
     }
     if (!started) return start();
     if (connectionChanged) {
@@ -580,6 +980,9 @@ function createHardwareBuddyAdapter(options = {}) {
     applySettingsChange,
     notifyStateChanged,
     notifyPermissionsChanged,
+    createQuickCommand,
+    getQuickCommandPresets,
+    listQuickCommands,
     isEnabled: () => activeConfig.enabled === true,
     isStarted: () => started,
     getLastStatus: () => lastStatus,
@@ -596,4 +999,6 @@ module.exports = {
   classifyHardwareBuddyIssue,
   readRuntimeConfig,
   hardwareBuddySettingsEqual,
+  sanitizeHardwareBuddyPayload,
+  buildSidecarSpawnOptions,
 };

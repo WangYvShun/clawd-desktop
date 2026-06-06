@@ -135,6 +135,21 @@ describe("Codex permission response sanitizer", () => {
     assert.strictEqual(permission.__test.buildCodexPermissionResponseBody({ behavior: "ask" }), "{}");
   });
 
+  it("uses Codex-shaped Qwen responses while omitting unsupported fields", () => {
+    const permission = loadPermissionWithElectron();
+    const body = permission.__test.buildQwenCodePermissionResponseBody({
+      behavior: "allow",
+      message: "ignored",
+      updatedInput: { command: "nope" },
+      updatedPermissions: [{ type: "setMode", mode: "default" }],
+      interrupt: true,
+    });
+    const parsed = JSON.parse(body);
+
+    assert.deepStrictEqual(parsed.hookSpecificOutput.decision, { behavior: "allow" });
+    assert.strictEqual(permission.__test.buildQwenCodePermissionResponseBody({ behavior: "ask" }), "{}");
+  });
+
   it("keeps Antigravity allow/ask decisions and drops permissionOverrides", () => {
     const permission = loadPermissionWithElectron();
     const body = permission.__test.buildAntigravityPermissionResponseBody({
@@ -211,6 +226,50 @@ describe("Codex permission response sanitizer", () => {
     assert.strictEqual(api.pendingPermissions.length, 0);
   });
 
+  it("treats Qwen deny-and-focus as immediate no-decision and focuses terminal", () => {
+    const { api, focusCalls } = createCodexDecisionHarness();
+    const res = createFakeRes();
+    const bubble = createFakeBubble();
+    api.pendingPermissions.push({
+      res,
+      abortHandler: () => {},
+      suggestions: [],
+      sessionId: "qwen-code:s1",
+      bubble,
+      hideTimer: null,
+      toolName: "Bash",
+      toolInput: { command: "npm test" },
+      createdAt: Date.now(),
+      agentId: "qwen-code",
+      isQwenCode: true,
+      sourcePid: 456,
+      cwd: "/repo",
+      agentPid: 456,
+      pidChain: [789, 456],
+      model: "qwen3-coder-plus",
+    });
+
+    api.handleDecide({ sender: { __window: bubble } }, "deny-and-focus");
+
+    assert.strictEqual(res.statusCode, 204);
+    assert.strictEqual(res.body, "");
+    assert.deepStrictEqual(focusCalls, [[
+      "qwen-code:s1",
+      {
+        fallbackEntry: {
+          id: "qwen-code:s1",
+          agentId: "qwen-code",
+          sourcePid: 456,
+          cwd: "/repo",
+          agentPid: 456,
+          pidChain: [789, 456],
+          model: "qwen3-coder-plus",
+        },
+      },
+    ]]);
+    assert.strictEqual(api.pendingPermissions.length, 0);
+  });
+
   it("does not let Codex take suggestion or opencode-only decision paths", () => {
     for (const behavior of ["suggestion:0", "opencode-always"]) {
       const { api } = createCodexDecisionHarness();
@@ -236,34 +295,6 @@ describe("Codex permission response sanitizer", () => {
       assert.strictEqual(res.body, "");
       assert.strictEqual(api.pendingPermissions.length, 0);
     }
-  });
-
-  it("treats Pi deny-and-focus as immediate no-decision instead of hanging the socket", () => {
-    const { api, focusCalls } = createCodexDecisionHarness();
-    const res = createFakeRes();
-    const bubble = createFakeBubble();
-    const permEntry = {
-      res,
-      abortHandler: () => {},
-      suggestions: [],
-      sessionId: "pi:s1",
-      bubble,
-      hideTimer: null,
-      toolName: "bash",
-      toolInput: { command: "npm test" },
-      createdAt: Date.now(),
-      agentId: "pi",
-      isPi: true,
-    };
-    api.pendingPermissions.push(permEntry);
-
-    api.handleDecide({ sender: { __window: bubble } }, "deny-and-focus");
-
-    assert.strictEqual(res.statusCode, 204);
-    assert.strictEqual(res.writableEnded, true);
-    assert.strictEqual(res.body, "");
-    assert.deepStrictEqual(focusCalls, [["pi:s1", { fallbackEntry: { id: "pi:s1", agentId: "pi" } }]]);
-    assert.strictEqual(api.pendingPermissions.length, 0);
   });
 
   it("treats Antigravity deny-and-focus as immediate no-decision instead of hanging the socket", () => {
@@ -344,46 +375,17 @@ describe("Codex permission response sanitizer", () => {
     }
   });
 
-  it("responds to Pi allow and deny with the shared permission response shape", () => {
-    for (const behavior of ["allow", "deny"]) {
-      const { api } = createCodexDecisionHarness();
-      const res = createFakeRes();
-      const bubble = createFakeBubble();
-      api.pendingPermissions.push({
-        res,
-        abortHandler: () => {},
-        suggestions: [],
-        sessionId: "pi:s1",
-        bubble,
-        hideTimer: null,
-        toolName: "bash",
-        toolInput: { command: "npm test" },
-        createdAt: Date.now(),
-        agentId: "pi",
-        isPi: true,
-      });
-
-      api.handleDecide({ sender: { __window: bubble } }, behavior);
-
-      assert.strictEqual(res.statusCode, 200);
-      const parsed = JSON.parse(res.body);
-      assert.strictEqual(parsed.hookSpecificOutput.hookEventName, "PermissionRequest");
-      assert.strictEqual(parsed.hookSpecificOutput.decision.behavior, behavior);
-      assert.strictEqual(api.pendingPermissions.length, 0);
-    }
-  });
-
   it("dismisses DND permissions without approving or denying on the user's behalf", () => {
     const { api } = createCodexDecisionHarness();
     const codexRes = createFakeRes();
+    const qwenRes = createFakeRes();
     const claudeRes = createFakeRes();
     const opencodeRes = createFakeRes();
-    const piRes = createFakeRes();
     const antigravityRes = createFakeRes();
     const codexBubble = createFakeBubble();
+    const qwenBubble = createFakeBubble();
     const claudeBubble = createFakeBubble();
     const opencodeBubble = createFakeBubble();
-    const piBubble = createFakeBubble();
     const antigravityBubble = createFakeBubble();
     const notifyBubble = createFakeBubble();
 
@@ -396,6 +398,15 @@ describe("Codex permission response sanitizer", () => {
         hideTimer: null,
         agentId: "codex",
         isCodex: true,
+      },
+      {
+        res: qwenRes,
+        abortHandler: () => {},
+        sessionId: "qwen-code:s1",
+        bubble: qwenBubble,
+        hideTimer: null,
+        agentId: "qwen-code",
+        isQwenCode: true,
       },
       {
         res: claudeRes,
@@ -415,15 +426,6 @@ describe("Codex permission response sanitizer", () => {
         bridgeUrl: "http://127.0.0.1:9",
         bridgeToken: "token",
         requestId: "req-1",
-      },
-      {
-        res: piRes,
-        abortHandler: () => {},
-        sessionId: "pi:s1",
-        bubble: piBubble,
-        hideTimer: null,
-        agentId: "pi",
-        isPi: true,
       },
       {
         res: antigravityRes,
@@ -446,19 +448,51 @@ describe("Codex permission response sanitizer", () => {
 
     assert.strictEqual(codexRes.statusCode, 204);
     assert.strictEqual(codexRes.body, "");
-    assert.strictEqual(piRes.statusCode, 204);
-    assert.strictEqual(piRes.body, "");
+    assert.strictEqual(qwenRes.statusCode, 204);
+    assert.strictEqual(qwenRes.body, "");
     assert.strictEqual(antigravityRes.statusCode, 204);
     assert.strictEqual(antigravityRes.body, "");
     assert.strictEqual(claudeRes.destroyed, true);
     assert.strictEqual(opencodeRes.destroyed, false);
     assert.strictEqual(opencodeRes.statusCode, null);
     assert.strictEqual(codexBubble.hidden, true);
+    assert.strictEqual(qwenBubble.hidden, true);
     assert.strictEqual(claudeBubble.hidden, true);
     assert.strictEqual(opencodeBubble.hidden, true);
-    assert.strictEqual(piBubble.hidden, true);
     assert.strictEqual(antigravityBubble.hidden, true);
     assert.strictEqual(notifyBubble.hidden, true);
+    assert.strictEqual(api.pendingPermissions.length, 0);
+  });
+
+  it("cleans up Qwen permissions as no-decision when Clawd quits", () => {
+    const { api } = createCodexDecisionHarness();
+    const qwenRes = createFakeRes();
+    const claudeRes = createFakeRes();
+    api.pendingPermissions.push(
+      {
+        res: qwenRes,
+        abortHandler: () => {},
+        sessionId: "qwen-code:s1",
+        bubble: createFakeBubble(),
+        hideTimer: null,
+        agentId: "qwen-code",
+        isQwenCode: true,
+      },
+      {
+        res: claudeRes,
+        abortHandler: () => {},
+        sessionId: "claude:s1",
+        bubble: createFakeBubble(),
+        hideTimer: null,
+        agentId: "claude-code",
+      }
+    );
+
+    api.cleanup();
+
+    assert.strictEqual(qwenRes.statusCode, 204);
+    assert.strictEqual(qwenRes.body, "");
+    assert.match(claudeRes.body, /deny/);
     assert.strictEqual(api.pendingPermissions.length, 0);
   });
 });

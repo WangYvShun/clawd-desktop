@@ -40,11 +40,16 @@ module.exports = function initMenu(ctx) {
   function buildMiniModeMenuItem() {
     const miniSupported = isMiniSupported();
     const inMiniMode = ctx.getMiniMode();
+    const miniDisabled = typeof ctx.getDisableMiniMode === "function" && ctx.getDisableMiniMode();
     return {
       label: inMiniMode ? t("exitMiniMode") : t("miniMode"),
       enabled: !ctx.getMiniTransitioning()
-        && (inMiniMode || (miniSupported && !(ctx.doNotDisturb && !inMiniMode))),
-      click: () => inMiniMode ? ctx.exitMiniMode() : ctx.enterMiniViaMenu(),
+        && (inMiniMode || (!miniDisabled && miniSupported && !(ctx.doNotDisturb && !inMiniMode))),
+      click: () => {
+        if (inMiniMode) return ctx.exitMiniMode();
+        if (miniDisabled) return undefined;
+        return ctx.enterMiniViaMenu();
+      },
     };
   }
 
@@ -165,6 +170,15 @@ module.exports = function initMenu(ctx) {
         },
       },
       buildBringToPrimaryDisplayMenuItem(),
+    );
+    // #329: surface the update item in the tray menu. The label switches
+    // to "Update available · vX" / "Update Ready" when applicable. Click
+    // routes to checkForUpdates / quitAndInstall via getUpdateMenuItem.
+    if (typeof ctx.getUpdateMenuItem === "function") {
+      const updateItem = ctx.getUpdateMenuItem();
+      if (updateItem) items.push({ type: "separator" }, updateItem);
+    }
+    items.push(
       { type: "separator" },
       {
         label: ctx.petHidden ? t("showPet") : t("hidePet"),
@@ -316,6 +330,24 @@ module.exports = function initMenu(ctx) {
           if (typeof ctx.openDashboard === "function") ctx.openDashboard();
         },
       },
+      { type: "separator" },
+      {
+        label: t("newSession"),
+        submenu: [
+          {
+            label: t("newSessionSelectFolder"),
+            click: () => {
+              if (typeof ctx.newSessionWithFolder === "function") ctx.newSessionWithFolder(t);
+            },
+          },
+          {
+            label: t("newSessionHomeDir"),
+            click: () => {
+              if (typeof ctx.newSessionInCurrentDir === "function") ctx.newSessionInCurrentDir(t);
+            },
+          },
+        ],
+      },
     ];
     // sendToDisplay is a multi-display-only tail entry. Push dynamically
     // (rather than visible:false) — Electron leaves a phantom gap for
@@ -356,6 +388,13 @@ module.exports = function initMenu(ctx) {
         label: t("settings"),
         click: () => ctx.openSettingsWindow(),
       },
+    );
+    // #329: surface the update item in the right-click context menu too.
+    if (typeof ctx.getUpdateMenuItem === "function") {
+      const updateItem = ctx.getUpdateMenuItem();
+      if (updateItem) template.push({ type: "separator" }, updateItem);
+    }
+    template.push(
       { type: "separator" },
       { label: t("quit"), click: () => requestAppQuit() },
     );
@@ -399,6 +438,7 @@ module.exports = function initMenu(ctx) {
     rebuildAllMenus,
     createTray,
     destroyTray,
+    getTray: () => ctx.tray,
     applyDockVisibility,
     ensureContextMenuOwner,
     popupMenuAt,

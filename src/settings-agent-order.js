@@ -6,9 +6,10 @@ function buildSettingsAgentOrderExports() {
     "codex",
     "gemini-cli",
     "kimi-cli",
+    "qwen-code",
     "opencode",
-    "pi",
     "codebuddy",
+    "qoder",
   ];
 
   const NON_COLLAPSIBLE_AGENT_PRIORITY = [
@@ -16,6 +17,7 @@ function buildSettingsAgentOrderExports() {
     "cursor-agent",
     "copilot-cli",
     "kiro-cli",
+    "pi",
     "openclaw",
     "hermes",
   ];

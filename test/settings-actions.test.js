@@ -6,6 +6,7 @@ const assert = require("node:assert");
 const {
   updateRegistry,
   commandRegistry,
+  MANAGED_CLEANUP_AGENT_IDS,
   requireBoolean,
   requireFiniteNumber,
   requireEnum,
@@ -78,10 +79,10 @@ describe("updateRegistry pure-data validators", () => {
     const deps = { snapshot: baseSnapshot };
     for (const key of [
       "sessionHudEnabled", "sessionHudShowElapsed", "sessionHudCleanupDetached",
-      "sessionHudAutoHide", "sessionHudPinned",
+      "sessionHudShowStateLabels", "sessionHudPinned",
       "miniMode", "openAtLoginHydrated", "soundMuted", "bubbleFollowPet",
       "hideBubbles", "permissionBubblesEnabled", "lowPowerIdleMode",
-      "allowEdgePinning", "keepSizeAcrossDisplays",
+      "allowEdgePinning", "disableMiniMode", "keepSizeAcrossDisplays",
     ]) {
       assert.strictEqual(updateRegistry[key](true, deps).status, "ok", `${key}(true)`);
       assert.strictEqual(updateRegistry[key](false, deps).status, "ok", `${key}(false)`);
@@ -223,6 +224,19 @@ describe("updateRegistry pure-data validators", () => {
       allowedTgUserId: "123456789",
       targetSessionKey: "telegram:0",
     }, deps).status, "error");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:987654321",
+      completionOutputMode: "full",
+      r3DirectSendEnabled: true,
+    }, deps).status, "ok");
+    assert.strictEqual(updateRegistry.tgApproval({
+      enabled: true,
+      allowedTgUserId: "123456789",
+      targetSessionKey: "telegram:987654321",
+      completionOutputMode: "summary",
+    }, deps).status, "error");
   });
 
   it("hardwareBuddy accepts only the normalized product settings shape", () => {
@@ -232,6 +246,7 @@ describe("updateRegistry pure-data validators", () => {
       address: "00:4B:12:A1:9E:A6",
       namePrefix: "Claude",
       permissionsEnabled: false,
+      quickCommandsEnabled: true,
     }).status, "ok");
     assert.strictEqual(updateRegistry.hardwareBuddy({ enabled: true }).status, "error");
     assert.strictEqual(updateRegistry.hardwareBuddy({
@@ -240,6 +255,7 @@ describe("updateRegistry pure-data validators", () => {
       address: "",
       namePrefix: "Claude",
       permissionsEnabled: false,
+      quickCommandsEnabled: false,
     }).status, "error");
   });
 
@@ -486,6 +502,59 @@ describe("telegram approval commands", () => {
     const missing = await commandRegistry["telegramApproval.tokenInfo"](null, {});
     assert.equal(missing.status, "error");
   });
+
+  it("telegramApproval.deleteTokenFile proxies the guarded main-process helper", async () => {
+    const calls = [];
+    const result = await commandRegistry["telegramApproval.deleteTokenFile"](null, {
+      deleteTelegramApprovalTokenFile: async () => {
+        calls.push(true);
+        return { status: "ok", deleted: true };
+      },
+    });
+    assert.deepStrictEqual(result, { status: "ok", deleted: true });
+    assert.deepStrictEqual(calls, [true]);
+
+    const guarded = await commandRegistry["telegramApproval.deleteTokenFile"](null, {
+      deleteTelegramApprovalTokenFile: async () => ({
+        status: "error",
+        code: "TOKEN_FILE_IN_USE",
+        message: "Native Telegram currently uses the shared token file.",
+      }),
+    });
+    assert.strictEqual(guarded.status, "error");
+    assert.strictEqual(guarded.code, "TOKEN_FILE_IN_USE");
+
+    const missing = await commandRegistry["telegramApproval.deleteTokenFile"](null, {});
+    assert.equal(missing.status, "error");
+  });
+
+  it("telegramMigration.dispatch only accepts renderer-callable user events", async () => {
+    const calls = [];
+    const deps = {
+      telegramMigration: {
+        getSnapshot: () => ({ state: "TESTING_NATIVE" }),
+        dispatch: async (event) => {
+          calls.push(event);
+          return { ok: true, state: "TESTING_NATIVE" };
+        },
+      },
+    };
+
+    const allowed = await commandRegistry["telegramMigration.dispatch"](
+      { type: "USER_TEST_NATIVE" },
+      deps,
+    );
+    assert.strictEqual(allowed.status, "ok");
+    assert.deepStrictEqual(calls, [{ type: "USER_TEST_NATIVE" }]);
+
+    const blocked = await commandRegistry["telegramMigration.dispatch"](
+      { type: "TEST_SUCCESS", at: 123 },
+      deps,
+    );
+    assert.strictEqual(blocked.status, "error");
+    assert.strictEqual(blocked.errorCode, "EVENT_NOT_ALLOWED");
+    assert.deepStrictEqual(calls, [{ type: "USER_TEST_NATIVE" }]);
+  });
 });
 
 describe("bubble policy commands", () => {
@@ -562,6 +631,169 @@ describe("bubble policy commands", () => {
   });
 });
 
+describe("session cleanup interval validators", () => {
+  const snapshot = prefs.getDefaults();
+
+  it("sessionStaleMs accepts 0 (disabled) regardless of workingStaleMs", () => {
+    const result = updateRegistry.sessionStaleMs(0, { snapshot });
+    assert.strictEqual(result.status, "ok");
+  });
+
+  it("sessionStaleMs accepts non-zero values >= current workingStaleMs", () => {
+    const result = updateRegistry.sessionStaleMs(600_000, { snapshot });
+    assert.strictEqual(result.status, "ok");
+  });
+
+  it("sessionStaleMs rejects values below the workingStaleMs floor", () => {
+    const result = updateRegistry.sessionStaleMs(60_000, {
+      snapshot: { ...snapshot, workingStaleMs: 300_000 },
+    });
+    assert.strictEqual(result.status, "error");
+    assert.match(result.message, /workingStaleMs/);
+  });
+
+  it("sessionStaleMs rejects non-integers / out-of-range", () => {
+    assert.strictEqual(updateRegistry.sessionStaleMs("nope", { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.sessionStaleMs(1.5, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.sessionStaleMs(30_000, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.sessionStaleMs(90_000_000, { snapshot }).status, "error");
+  });
+
+  it("workingStaleMs rejects values above sessionStaleMs when the latter is non-zero", () => {
+    const result = updateRegistry.workingStaleMs(700_000, {
+      snapshot: { ...snapshot, sessionStaleMs: 600_000 },
+    });
+    assert.strictEqual(result.status, "error");
+    assert.match(result.message, /sessionStaleMs/);
+  });
+
+  it("workingStaleMs accepts any in-range value when sessionStaleMs is 0", () => {
+    const result = updateRegistry.workingStaleMs(700_000, {
+      snapshot: { ...snapshot, sessionStaleMs: 0 },
+    });
+    assert.strictEqual(result.status, "ok");
+  });
+
+  it("workingStaleMs accepts equal to sessionStaleMs", () => {
+    const result = updateRegistry.workingStaleMs(600_000, {
+      snapshot: { ...snapshot, sessionStaleMs: 600_000 },
+    });
+    assert.strictEqual(result.status, "ok");
+  });
+
+  it("workingStaleMs rejects below floor / above ceiling", () => {
+    assert.strictEqual(updateRegistry.workingStaleMs(0, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.workingStaleMs(20_000, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.workingStaleMs(90_000_000, { snapshot }).status, "error");
+  });
+
+  it("detachedIdleStaleMs enforces 5s-300s integer range", () => {
+    assert.strictEqual(updateRegistry.detachedIdleStaleMs(5_000, { snapshot }).status, "ok");
+    assert.strictEqual(updateRegistry.detachedIdleStaleMs(300_000, { snapshot }).status, "ok");
+    assert.strictEqual(updateRegistry.detachedIdleStaleMs(0, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.detachedIdleStaleMs(1_000, { snapshot }).status, "error");
+    assert.strictEqual(updateRegistry.detachedIdleStaleMs(400_000, { snapshot }).status, "error");
+  });
+});
+
+describe("sessionCleanup.setTriple command", () => {
+  const cmd = commandRegistry["sessionCleanup.setTriple"];
+  const baseSnapshot = prefs.getDefaults();
+
+  it("commits a full valid triple", async () => {
+    const result = await cmd(
+      {
+        sessionStaleMs: 600_000,
+        workingStaleMs: 300_000,
+        detachedIdleStaleMs: 30_000,
+      },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(result.status, "ok");
+    assert.deepStrictEqual(result.commit, {
+      sessionStaleMs: 600_000,
+      workingStaleMs: 300_000,
+      detachedIdleStaleMs: 30_000,
+    });
+  });
+
+  it("rejects an inverted triple (workingStaleMs > sessionStaleMs)", async () => {
+    const result = await cmd(
+      {
+        sessionStaleMs: 120_000,
+        workingStaleMs: 300_000,
+        detachedIdleStaleMs: 30_000,
+      },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(result.status, "error");
+    assert.match(result.message, /workingStaleMs.*must be <= sessionStaleMs/);
+  });
+
+  it("accepts sessionStaleMs=0 with any in-range workingStaleMs", async () => {
+    const result = await cmd(
+      {
+        sessionStaleMs: 0,
+        workingStaleMs: 86_400_000,
+        detachedIdleStaleMs: 30_000,
+      },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(result.status, "ok");
+    assert.deepStrictEqual(result.commit, {
+      sessionStaleMs: 0,
+      workingStaleMs: 86_400_000,
+      detachedIdleStaleMs: 30_000,
+    });
+  });
+
+  it("defaults absent fields from the snapshot", async () => {
+    const snapshot = {
+      ...baseSnapshot,
+      sessionStaleMs: 900_000,
+      workingStaleMs: 450_000,
+      detachedIdleStaleMs: 45_000,
+    };
+    const result = await cmd({ sessionStaleMs: 600_000 }, { snapshot });
+    assert.strictEqual(result.status, "ok");
+    assert.deepStrictEqual(result.commit, {
+      sessionStaleMs: 600_000,
+      workingStaleMs: 450_000,
+      detachedIdleStaleMs: 45_000,
+    });
+  });
+
+  it("rejects payload with non-integer present value (no silent snapshot fallback)", async () => {
+    const result = await cmd(
+      { sessionStaleMs: "600000" },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(result.status, "error");
+    assert.match(result.message, /sessionStaleMs.*must be an integer/);
+  });
+
+  it("rejects out-of-range fields without committing", async () => {
+    const tooSmall = await cmd(
+      { sessionStaleMs: 600_000, workingStaleMs: 1_000, detachedIdleStaleMs: 30_000 },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(tooSmall.status, "error");
+    assert.strictEqual(tooSmall.commit, undefined);
+
+    const detTooBig = await cmd(
+      { sessionStaleMs: 600_000, workingStaleMs: 300_000, detachedIdleStaleMs: 999_999 },
+      { snapshot: baseSnapshot }
+    );
+    assert.strictEqual(detTooBig.status, "error");
+    assert.strictEqual(detTooBig.commit, undefined);
+  });
+
+  it("rejects non-object payload", async () => {
+    const r = await cmd(null, { snapshot: baseSnapshot });
+    assert.strictEqual(r.status, "error");
+  });
+});
+
 describe("hook commands", () => {
   it("installHooks triggers a one-shot Claude sync without changing prefs", async () => {
     let syncCalls = 0;
@@ -610,6 +842,33 @@ describe("hook commands", () => {
     assert.match(r.message, /disk locked/);
     assert.deepStrictEqual(calls, ["stop", "uninstall", "start"]);
   });
+
+  it("cleanupIntegrations disables all managed agents before running cleanup", async () => {
+    const calls = [];
+    const snapshot = prefs.getDefaults();
+    const result = await commandRegistry.cleanupIntegrations(null, {
+      snapshot,
+      stopIntegrationForAgent: (agentId) => calls.push(["stopIntegration", agentId]),
+      stopMonitorForAgent: (agentId) => calls.push(["stopMonitor", agentId]),
+      clearSessionsByAgent: (agentId) => calls.push(["clearSessions", agentId]),
+      dismissPermissionsByAgent: (agentId) => calls.push(["dismissPermissions", agentId]),
+      cleanupIntegrations: (options) => {
+        calls.push(["cleanup", options.source]);
+        return {
+          mode: "apply",
+          summary: { agentsChecked: 14, agentsAffected: 2, entriesRemoved: 3, skipped: 12, failed: 0 },
+        };
+      },
+    });
+
+    assert.strictEqual(result.status, "ok");
+    assert.strictEqual(result.cleanup.summary.entriesRemoved, 3);
+    for (const agentId of MANAGED_CLEANUP_AGENT_IDS) {
+      assert.strictEqual(result.commit.agents[agentId].enabled, false, `${agentId} should be disabled`);
+    }
+    assert.deepStrictEqual(calls.at(-1), ["cleanup", "about"]);
+    assert.deepStrictEqual(calls[0], ["stopIntegration", "claude-code"]);
+  });
 });
 
 describe("doctor repair commands", () => {
@@ -643,16 +902,18 @@ describe("doctor repair commands", () => {
     assert.deepStrictEqual(calls, [{ agentId: "codex", options: { forceCodexHooksFeature: true } }]);
   });
 
-  it("rejects Copilot CLI because it is manual-only", async () => {
+  it("accepts Copilot CLI through the standard auto-repair path", async () => {
     const calls = [];
     const r = await commandRegistry.repairAgentIntegration({ agentId: "copilot-cli" }, {
       snapshot: prefs.getDefaults(),
-      repairIntegrationForAgent: (agentId) => calls.push(agentId),
+      repairIntegrationForAgent: (agentId) => {
+        calls.push(agentId);
+        return { status: "ok", added: 10, updated: 0 };
+      },
     });
 
-    assert.strictEqual(r.status, "error");
-    assert.match(r.message, /manual/i);
-    assert.deepStrictEqual(calls, []);
+    assert.strictEqual(r.status, "ok");
+    assert.deepStrictEqual(calls, ["copilot-cli"]);
   });
 
   it("does not repair disabled agents", async () => {

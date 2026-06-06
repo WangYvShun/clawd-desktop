@@ -82,6 +82,8 @@ class FakeElement {
 
 function createRendererHarness() {
   const timers = [];
+  const audioInstances = [];
+  const electronHandlers = {};
   const container = new FakeElement("div");
   container.id = "pet-container";
   container.isConnected = true;
@@ -102,7 +104,11 @@ function createRendererHarness() {
     },
   };
   const electronAPI = new Proxy({}, {
-    get() {
+    get(_target, prop) {
+      const name = String(prop);
+      if (name.startsWith("on")) {
+        return (callback) => { electronHandlers[name] = callback; };
+      }
       return () => {};
     },
   });
@@ -131,8 +137,17 @@ function createRendererHarness() {
     cancelAnimationFrame(timer) {
       context.clearTimeout(timer);
     },
-    Audio: function FakeAudio() {
-      return { play: () => Promise.resolve(), volume: 1, currentTime: 0 };
+    Audio: function FakeAudio(url) {
+      this.url = url;
+      this.volume = 1;
+      this.currentTime = 0;
+      this.loadCalls = 0;
+      this.playCalls = 0;
+      this.pauseCalls = 0;
+      this.load = () => { this.loadCalls++; };
+      this.play = () => { this.playCalls++; return Promise.resolve(); };
+      this.pause = () => { this.pauseCalls++; };
+      audioInstances.push(this);
     },
   };
   context.globalThis = context;
@@ -153,6 +168,8 @@ globalThis.__rendererTest = {
     container,
     clawd,
     timers,
+    audioInstances,
+    electronHandlers,
     api: context.__rendererTest,
     activeTimers: () => timers.filter((timer) => !timer.cleared),
   };
@@ -213,6 +230,15 @@ describe("renderer low-power idle mode", () => {
     assert.ok(preload.includes('setLowPowerIdlePaused: (paused) => ipcRenderer.send("low-power-idle-paused", !!paused)'));
   });
 
+  it("relays low-power pauses to trusted scripted SVG runtimes", () => {
+    const source = readNormalized(RENDERER);
+
+    assert.ok(source.includes("function setCurrentScriptedSvgLowPowerPaused(paused)"));
+    assert.ok(source.includes("target.contentWindow.__clawdSetLowPowerPaused"));
+    assert.ok(source.includes("setCurrentScriptedSvgLowPowerPaused(true);"));
+    assert.ok(source.includes("setCurrentScriptedSvgLowPowerPaused(false);"));
+  });
+
   it("resets main's paused mirror on renderer reload/crash and boosts eye resend on resume", () => {
     const source = readNormalized(MAIN);
 
@@ -244,9 +270,9 @@ describe("renderer object-channel selection", () => {
     const source = readNormalized(RENDERER);
 
     assert.ok(source.includes("swapToFile(svgFile, null);"));
-    assert.ok(source.includes("swapToFile(_dragSvg, null);"));
+    assert.ok(source.includes("swapToFile(dragSvg, null);"));
     assert.ok(!source.includes("swapToFile(svgFile, null, false);"));
-    assert.ok(!source.includes("swapToFile(_dragSvg, null, false);"));
+    assert.ok(!source.includes("swapToFile(dragSvg, null, false);"));
   });
 
   it("uses a monotonic cache-bust counter for remaining img-channel SVG swaps", () => {
@@ -318,6 +344,36 @@ describe("renderer Cloudling pointer bridge", () => {
     assert.ok(source.includes('svgWindow.__cloudlingSetPointer(payload);'));
     assert.ok(source.includes('window.electronAPI.onCloudlingPointer((payload) => {'));
     assert.ok(preload.includes('onCloudlingPointer: (callback) => ipcRenderer.on("cloudling-pointer", (_, payload) => callback(payload))'));
+  });
+});
+
+describe("renderer sound preload and warmup", () => {
+  it("preloads sound files without playing a primer", () => {
+    const harness = createRendererHarness();
+    const preload = harness.electronHandlers.onPreloadSounds;
+
+    assert.strictEqual(typeof preload, "function");
+    preload({ urls: ["file:///complete.mp3"] });
+
+    assert.strictEqual(harness.audioInstances.length, 1);
+    assert.strictEqual(harness.audioInstances[0].url, "file:///complete.mp3");
+    assert.strictEqual(harness.audioInstances[0].loadCalls, 1);
+    assert.strictEqual(harness.audioInstances[0].playCalls, 0);
+  });
+
+  it("does not reload a cached sound object on playback", () => {
+    const harness = createRendererHarness();
+    const preload = harness.electronHandlers.onPreloadSounds;
+    const playSound = harness.electronHandlers.onPlaySound;
+
+    preload({ urls: ["file:///complete.mp3"] });
+    const cached = harness.audioInstances[0];
+    playSound({ url: "file:///complete.mp3", volume: 1 });
+
+    assert.strictEqual(cached.loadCalls, 1);
+    assert.strictEqual(harness.audioInstances.length, 2);
+    assert.strictEqual(harness.audioInstances[1].url, "file:///complete.mp3");
+    assert.strictEqual(harness.audioInstances[1].playCalls, 1);
   });
 });
 

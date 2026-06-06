@@ -4,9 +4,18 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { execFileSync: defaultExecFileSync } = require("child_process");
 const { resolveNodeBin } = require("./server-config");
-const { writeJsonAtomic, asarUnpackedPath, formatNodeHookCommand } = require("./json-utils");
+const {
+  readJsonFile,
+  writeJsonAtomic,
+  writeJsonAtomicWithBackup,
+  asarUnpackedPath,
+  formatNodeHookCommand,
+  buildWindowsEncodedNodeHookCommand,
+  decodeWindowsEncodedCommand,
+  extractFirstQuotedToken,
+  windowsPowerShellBin,
+} = require("./json-utils");
 
 const HOOK_GROUP_ID = "clawd";
 const MARKER = "antigravity-hook.js";
@@ -38,46 +47,8 @@ function buildAntigravityHookCommand(nodeBin, hookScript, event, options = {}) {
   });
 }
 
-function quotePowerShellSingleArg(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
-}
-
-function windowsPowerShellBin(options = {}) {
-  if (options.powerShellBin) return options.powerShellBin;
-  const root = process.env.SystemRoot || "C:\\Windows";
-  return path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-}
-
 function buildWindowsAntigravityHookCommand(nodeBin, hookScript, event, options = {}) {
-  const psCommand = [
-    "&",
-    quotePowerShellSingleArg(nodeBin),
-    quotePowerShellSingleArg(hookScript),
-    quotePowerShellSingleArg(event),
-  ].join(" ");
-  const encodedCommand = Buffer.from(psCommand, "utf16le").toString("base64");
-  return `${windowsPowerShellBin(options)} -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encodedCommand}`;
-}
-
-function decodeWindowsEncodedCommand(command) {
-  const match = String(command || "").match(/(?:^|\s)-(?:EncodedCommand|enc|e)\s+([A-Za-z0-9+/=]+)/i);
-  if (!match) return null;
-  try {
-    const decoded = Buffer.from(match[1], "base64").toString("utf16le").trim();
-    return decoded || null;
-  } catch {
-    return null;
-  }
-}
-
-function extractFirstQuotedToken(command) {
-  const text = String(command || "").trim().replace(/^&\s+/, "");
-  const single = text.match(/^'((?:''|[^'])*)'/);
-  if (single) return single[1].replace(/''/g, "'");
-  const double = text.match(/^"((?:\\"|[^"])*)"/);
-  if (double) return double[1].replace(/\\"/g, "\"").replace(/\\\\/g, "\\");
-  const bare = text.match(/^(\S+)/);
-  return bare ? bare[1] : null;
+  return buildWindowsEncodedNodeHookCommand(nodeBin, hookScript, [event], options);
 }
 
 function extractNodeBinFromCommand(command) {
@@ -121,44 +92,8 @@ function extractExistingAntigravityNodeBin(existingGroup) {
   return null;
 }
 
-function isNodeExecutablePath(value) {
-  return /(?:^|[\\/])node(?:\.exe)?$/i.test(String(value || ""));
-}
-
-function firstNonEmptyLine(value) {
-  return String(value || "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean) || null;
-}
-
-function resolveWindowsNodeBin(options = {}) {
-  const execPath = options.execPath || process.execPath;
-  if (isNodeExecutablePath(execPath)) return execPath;
-
-  const execFileSync = options.execFileSync || defaultExecFileSync;
-  try {
-    const whereExe = process.env.SystemRoot
-      ? path.join(process.env.SystemRoot, "System32", "where.exe")
-      : "where.exe";
-    const output = execFileSync(whereExe, ["node"], {
-      encoding: "utf8",
-      timeout: 2000,
-      windowsHide: true,
-    });
-    const resolved = firstNonEmptyLine(output);
-    if (resolved) return resolved;
-  } catch {}
-
-  return null;
-}
-
 function resolveAntigravityNodeBin(options = {}) {
   if (options.nodeBin !== undefined) return options.nodeBin;
-  const platform = options.platform || process.platform;
-  if (platform === "win32") {
-    return resolveWindowsNodeBin(options);
-  }
   return resolveNodeBin(options);
 }
 
@@ -186,7 +121,7 @@ function hasAntigravityConfig(homeDir) {
 
 function readJsonIfExists(filePath) {
   try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return readJsonFile(filePath);
   } catch (err) {
     if (err && err.code === "ENOENT") return null;
     throw err;
@@ -251,6 +186,31 @@ function registerAntigravityHooks(options = {}) {
   return { installed: true, added, updated, skipped, configPath };
 }
 
+function groupHasClawdMarker(group) {
+  if (!group || typeof group !== "object" || Array.isArray(group)) return false;
+  return ANTIGRAVITY_HOOK_EVENTS.some((event) =>
+    collectHookCommandsFromEntries(group[event]).length > 0
+  );
+}
+
+function unregisterAntigravityHooks(options = {}) {
+  const homeDir = options.homeDir || os.homedir();
+  const configPath = options.configPath || path.join(homeDir, ".gemini", "config", "hooks.json");
+  const settings = normalizeSettings(readJsonIfExists(configPath));
+  const group = settings[HOOK_GROUP_ID];
+
+  if (!groupHasClawdMarker(group)) {
+    return { installed: !!group, removed: 0, changed: false, configPath };
+  }
+
+  delete settings[HOOK_GROUP_ID];
+  const backupPath = writeJsonAtomicWithBackup(configPath, settings, options);
+  if (!options.silent) console.log(`Clawd Antigravity hook group removed -> ${configPath}`);
+  const result = { installed: true, removed: 1, changed: true, configPath };
+  if (options.backup === true) result.backupPath = backupPath;
+  return result;
+}
+
 module.exports = {
   HOOK_GROUP_ID,
   MARKER,
@@ -258,6 +218,7 @@ module.exports = {
   DEFAULT_CONFIG_PATH,
   ANTIGRAVITY_HOOK_EVENTS,
   registerAntigravityHooks,
+  unregisterAntigravityHooks,
   __test: {
     buildAntigravityHookCommand,
     buildAntigravityHooks,
@@ -265,16 +226,17 @@ module.exports = {
     decodeWindowsEncodedCommand,
     extractExistingAntigravityNodeBin,
     extractNodeBinFromCommand,
+    groupHasClawdMarker,
     hasAntigravityConfig,
     normalizeSettings,
     resolveAntigravityNodeBin,
-    resolveWindowsNodeBin,
   },
 };
 
 if (require.main === module) {
   try {
-    registerAntigravityHooks({});
+    if (process.argv.includes("--uninstall")) unregisterAntigravityHooks({});
+    else registerAntigravityHooks({});
   } catch (err) {
     console.error(err.message);
     process.exit(1);

@@ -31,6 +31,13 @@ const TAB_MODULES = [
   path.join(SRC_DIR, "settings-tab-about.js"),
   path.join(SRC_DIR, "settings-hardware-buddy-panel.js"),
 ];
+const VERIFIED_GITHUB_CONTRIBUTORS = [
+  "Bynlk",
+  "zxypro1",
+  "NeroAyase",
+  "divergentD",
+  "Ne9roni",
+];
 
 function createDeferred() {
   const deferred = {};
@@ -41,12 +48,16 @@ function createDeferred() {
   return deferred;
 }
 
-function loadSettingsI18nForTest() {
+function loadSettingsI18nBundleForTest() {
   const context = { globalThis: null };
   context.globalThis = context;
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(SETTINGS_I18N, "utf8"), context);
-  return context.ClawdSettingsI18n.STRINGS;
+  return context.ClawdSettingsI18n;
+}
+
+function loadSettingsI18nForTest() {
+  return loadSettingsI18nBundleForTest().STRINGS;
 }
 
 function loadSettingsCoreForTest(settingsAPI) {
@@ -586,12 +597,14 @@ function makeGeneralSnapshot(overrides = {}) {
     lang: "en",
     size: 50,
     sessionHudEnabled: true,
+    sessionHudShowStateLabels: true,
     sessionHudShowElapsed: true,
     sessionHudCleanupDetached: true,
     soundMuted: false,
     soundVolume: 0.5,
     lowPowerIdleMode: false,
     allowEdgePinning: true,
+    disableMiniMode: false,
     keepSizeAcrossDisplays: true,
     manageClaudeHooksAutomatically: true,
     openAtLogin: false,
@@ -772,6 +785,8 @@ function loadAgentsTabForTest({
           rowCodexPermissionModeDesc: "Permission mode desc",
           codexPermissionModeNative: "Native",
           codexPermissionModeIntercept: "Intercept",
+          rowCodexNativeNotificationSound: "Native sound",
+          rowCodexNativeNotificationSoundDesc: "Native sound desc",
           badgePermissionBubble: "Permission bubble",
           eventSourceHook: "Hook",
           eventSourceLogPoll: "Log poll",
@@ -896,6 +911,7 @@ function loadAnimMapTabForTest({
 function loadTelegramApprovalTabForTest({
   snapshot,
   settingsAPI = {},
+  confirm = () => true,
 } = {}) {
   const body = new FakeElement("body");
   const content = new FakeElement("main");
@@ -940,6 +956,7 @@ function loadTelegramApprovalTabForTest({
     window: null,
     globalThis: null,
     settingsAPI: api,
+    confirm,
   };
   context.window = context;
   context.globalThis = context;
@@ -1237,7 +1254,24 @@ describe("settings renderer browser environment", () => {
     }
   });
 
+  it("keeps About contributors visible and includes verified GitHub contributors", () => {
+    const aboutSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-about.js"), "utf8");
+    const coreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    const css = fs.readFileSync(SETTINGS_CSS, "utf8");
+    const i18nBundle = loadSettingsI18nBundleForTest();
+
+    assert.ok(!aboutSource.includes("about-contributors-toggle"));
+    assert.ok(!aboutSource.includes("contributorsExpanded"));
+    assert.ok(!coreSource.includes("contributorsExpanded"));
+    assert.ok(!css.includes(".about-contributors-list.collapsed"));
+
+    for (const login of VERIFIED_GITHUB_CONTRIBUTORS) {
+      assert.ok(i18nBundle.CONTRIBUTORS.includes(login), `About contributors should include ${login}`);
+    }
+  });
+
   it("keeps Telegram approval drafts local across toggles and rerenders", async () => {
+    const commandCalls = [];
     const harness = loadTelegramApprovalTabForTest({
       snapshot: {
         tgApproval: {
@@ -1247,7 +1281,14 @@ describe("settings renderer browser environment", () => {
         },
       },
       settingsAPI: {
-        command: (name) => {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "IDLE", transport: "off", ownerSnapshot: {} },
+            });
+          }
           if (name === "telegramApproval.status") {
             return Promise.resolve({
               status: "ok",
@@ -1275,14 +1316,12 @@ describe("settings renderer browser environment", () => {
 
     harness.content.querySelector(".switch").dispatchEvent({ type: "click" });
 
-    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), [{
-      key: "tgApproval",
-      value: {
-        enabled: true,
-        allowedTgUserId: "123456789",
-        targetSessionKey: "telegram:123456789",
-      },
-    }]);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), []);
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_TEST_NATIVE"),
+      "turning on should use the native migration test flow",
+    );
 
     await Promise.resolve();
     await Promise.resolve();
@@ -1298,6 +1337,582 @@ describe("settings renderer browser environment", () => {
     harness.render();
 
     assert.equal(harness.content.querySelectorAll("input")[0].value, "987654321");
+  });
+
+  it("preserves notifyOnComplete=false through a Telegram approval disable save", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+          notifyOnComplete: false,
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "LEGACY_ACTIVE", transport: "legacy", ownerSnapshot: { sidecarRunning: true } },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "running", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    harness.content.querySelector(".switch").dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), [{
+      key: "tgApproval",
+      value: {
+        enabled: false,
+        allowedTgUserId: "123456789",
+        targetSessionKey: "telegram:123456789",
+        notifyOnComplete: false,
+        completionOutputMode: "off",
+        r3DirectSendEnabled: false,
+      },
+    }]);
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_DISABLE"),
+      "turning off should dispatch USER_DISABLE",
+    );
+  });
+
+  it("preserves notifyOnComplete=true through a Telegram recipient save", async () => {
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+          notifyOnComplete: true,
+          completionOutputMode: "off",
+          r3DirectSendEnabled: true,
+        },
+      },
+      settingsAPI: {
+        command: (name) => {
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "LEGACY_ACTIVE", transport: "legacy", ownerSnapshot: { sidecarRunning: true } },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "running", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const input = harness.content.querySelectorAll("input")[0];
+    input.value = "987654321";
+    input.dispatchEvent({ type: "input" });
+    const saveButton = harness.content.querySelectorAll("button")
+      .find((button) => button.textContent === "telegramApprovalSaveRecipient");
+    saveButton.dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), [{
+      key: "tgApproval",
+      value: {
+        enabled: true,
+        allowedTgUserId: "987654321",
+        targetSessionKey: "987654321",
+        notifyOnComplete: true,
+        completionOutputMode: "off",
+        r3DirectSendEnabled: true,
+      },
+    }]);
+  });
+
+  it("dispatches USER_DISABLE when the enabled switch is turned off (zombie-switch fix)", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "LEGACY_ACTIVE", transport: "legacy", ownerSnapshot: { sidecarRunning: true } },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "running", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    harness.content.querySelector(".switch").dispatchEvent({ type: "click" });
+
+    // The legacy switch still writes tgApproval.enabled = false…
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), [{
+      key: "tgApproval",
+      value: {
+        enabled: false,
+        allowedTgUserId: "123456789",
+        targetSessionKey: "telegram:123456789",
+        notifyOnComplete: false,
+        completionOutputMode: "off",
+        r3DirectSendEnabled: false,
+      },
+    }]);
+    // …and turning OFF must ALSO stop the native transport, otherwise the poller
+    // + completion notifications keep running (the zombie-switch bug).
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_DISABLE"),
+      "turning the switch off should dispatch USER_DISABLE",
+    );
+  });
+
+  it("requires confirmation before enabling full Telegram completion output", async () => {
+    const confirmCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+          notifyOnComplete: true,
+          completionOutputMode: "off",
+        },
+      },
+      confirm: (message) => {
+        confirmCalls.push(message);
+        return false;
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const select = harness.content.querySelector(".tg-approval-output-select");
+    assert.deepStrictEqual(select.children.map((option) => option.value), ["off", "full"]);
+    select.value = "full";
+    select.dispatchEvent({ type: "change" });
+
+    assert.deepStrictEqual(confirmCalls, ["telegramApprovalCompletionOutputFullConfirm"]);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), []);
+    assert.equal(select.value, "off");
+
+    const confirmed = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: true,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+          notifyOnComplete: true,
+          completionOutputMode: "off",
+        },
+      },
+      confirm: () => true,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    confirmed.render();
+
+    const confirmedSelect = confirmed.content.querySelector(".tg-approval-output-select");
+    confirmedSelect.value = "full";
+    confirmedSelect.dispatchEvent({ type: "change" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(confirmed.updates)), [{
+      key: "tgApproval",
+      value: {
+        enabled: true,
+        allowedTgUserId: "123456789",
+        targetSessionKey: "telegram:123456789",
+        notifyOnComplete: true,
+        completionOutputMode: "full",
+        r3DirectSendEnabled: false,
+      },
+    }]);
+  });
+
+  it("toggles Telegram Direct Send paste-only mode without changing the approval transport", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+          notifyOnComplete: false,
+          completionOutputMode: "full",
+          r3DirectSendEnabled: false,
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: {
+                state: "NATIVE_ACTIVE",
+                transport: "native",
+                ownerSnapshot: { nativePolling: true },
+              },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "running",
+                transport: "native",
+                configured: true,
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const sw = harness.content.querySelector(".tg-approval-direct-send-row .switch");
+    assert.equal(sw.getAttribute("aria-checked"), "false");
+    sw.dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), [{
+      key: "tgApproval",
+      value: {
+        enabled: false,
+        allowedTgUserId: "123456789",
+        targetSessionKey: "telegram:123456789",
+        notifyOnComplete: false,
+        completionOutputMode: "full",
+        r3DirectSendEnabled: true,
+      },
+    }]);
+    assert.equal(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"),
+      false,
+      "direct-send toggle should not start or stop the Telegram transport",
+    );
+  });
+
+  it("shows native-active Telegram approval as enabled even when the legacy flag is false", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: {
+                state: "NATIVE_ACTIVE",
+                transport: "native",
+                ownerSnapshot: { nativePolling: true },
+              },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "running",
+                transport: "native",
+                configured: true,
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok", snapshot: { state: "IDLE", transport: "off" } });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const sw = harness.content.querySelector(".switch");
+    assert.equal(sw.getAttribute("aria-checked"), "true");
+
+    sw.dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), []);
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_DISABLE"),
+      "turning off native-active approval should dispatch USER_DISABLE",
+    );
+  });
+
+  it("uses native running status while migration snapshot is still loading", async () => {
+    const commandCalls = [];
+    const never = new Promise(() => {});
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return never;
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "running",
+                transport: "native",
+                enabled: true,
+                configured: true,
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const sw = harness.content.querySelector(".switch");
+    assert.equal(sw.getAttribute("aria-checked"), "true");
+    assert.equal(sw.classList.contains("disabled"), false);
+
+    sw.dispatchEvent({ type: "click" });
+
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_DISABLE"),
+      "turning off native-running approval should not wait for the migration snapshot",
+    );
+  });
+
+  it("turning the Telegram approval switch on starts the native migration test", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "IDLE", transport: "off", ownerSnapshot: {} },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: { status: "stopped", configured: true, tokenStored: true },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    harness.content.querySelector(".switch").dispatchEvent({ type: "click" });
+
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(harness.updates)), []);
+    assert.equal(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_TEST_NATIVE"),
+      true,
+      "turning the switch on should dispatch the native test flow",
+    );
+    assert.equal(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_DISABLE"),
+      false,
+      "turning the switch on should not dispatch USER_DISABLE",
+    );
+  });
+
+  it("does not show Telegram approval enabled for broken native setup debt", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "NEEDS_SETUP", transport: "native", ownerSnapshot: {} },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "stopped",
+                transport: "native",
+                configured: true,
+                reason: "native-inactive",
+                message: "Native Telegram approval is not active",
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const sw = harness.content.querySelector(".switch");
+    assert.equal(sw.getAttribute("aria-checked"), "false");
+
+    sw.dispatchEvent({ type: "click" });
+    assert.ok(
+      commandCalls.some((c) => c.name === "telegramMigration.dispatch"
+        && c.payload && c.payload.type === "USER_TEST_NATIVE"),
+      "turning on from broken native setup should retry the native test flow",
+    );
+  });
+
+  it("disables the independent Telegram approval test while native migration is testing", async () => {
+    const commandCalls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: { state: "TESTING_NATIVE", ownerSnapshot: { nativePolling: true } },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({
+              status: "ok",
+              state: {
+                status: "starting",
+                transport: "native",
+                configured: true,
+                reason: "native-testing",
+                message: "Native Telegram approval test is already in progress",
+                tokenStored: true,
+              },
+            });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const testButton = harness.content.querySelectorAll("button")
+      .find((button) => button.textContent === "telegramApprovalSendTest");
+    assert.equal(testButton.disabled, true);
+    assert.match(testButton.title, /Native Telegram approval test/);
+
+    testButton.dispatchEvent({ type: "click" });
+    assert.equal(commandCalls.some((call) => call.name === "telegramApproval.test"), false);
   });
 
   it("disables Telegram approval test until runtime status is ready", async () => {
@@ -1408,6 +2023,72 @@ describe("settings renderer browser environment", () => {
     await Promise.resolve();
     await Promise.resolve();
     assert.equal(harness.renderRequests.length, beforeStatusResolve + 2);
+  });
+
+  it("wires the native migration delete-token button to a real command", async () => {
+    const commandCalls = [];
+    const toastMessages = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+      },
+      settingsAPI: {
+        command: (name, payload) => {
+          commandCalls.push({ name, payload });
+          if (name === "telegramMigration.snapshot") {
+            return Promise.resolve({
+              status: "ok",
+              snapshot: {
+                state: "NATIVE_ACTIVE",
+                runtimeStatus: { status: "running" },
+                ownerSnapshot: { sidecarRunning: false, nativePolling: true },
+                migrationInfo: {},
+                nativeVerifiedAt: 123,
+              },
+            });
+          }
+          if (name === "telegramApproval.status") {
+            return Promise.resolve({ status: "ok", state: { status: "stopped", tokenStored: true } });
+          }
+          if (name === "telegramApproval.tokenInfo") {
+            return Promise.resolve({ status: "ok", configured: true, masked: "1234……wXyZ" });
+          }
+          if (name === "telegramApproval.deleteTokenFile") {
+            return Promise.resolve({ status: "ok", deleted: true });
+          }
+          return Promise.resolve({ status: "ok" });
+        },
+      },
+    });
+    harness.core.ops.showToast = (message, options = {}) => {
+      toastMessages.push({ message, options });
+    };
+
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.render();
+
+    const deleteButton = harness.content
+      .querySelectorAll("button")
+      .find((button) => button.textContent === "Delete legacy token file");
+    assert.ok(deleteButton, "delete legacy token button should render for NATIVE_ACTIVE");
+
+    deleteButton.dispatchEvent({ type: "click" });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.equal(
+      commandCalls.some((call) => call.name === "telegramApproval.deleteTokenFile"),
+      true,
+    );
+    assert.equal(
+      toastMessages.some((toast) => /deleted/i.test(toast.message)),
+      true,
+    );
   });
 
   it("wires Clawd Doctor through Settings with Step 2 connection actions", () => {
@@ -1819,6 +2500,59 @@ describe("settings renderer browser environment", () => {
     assert.ok(i18nSource.includes("bubbleSecondsPrefix"));
   });
 
+  it("registers the Session cleanup group with three number rows, atomic reset, and i18n keys", () => {
+    const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
+    const i18nSource = fs.readFileSync(SETTINGS_I18N, "utf8");
+    const uiCoreSource = fs.readFileSync(SETTINGS_UI_CORE, "utf8");
+    const actionsSource = fs.readFileSync(path.join(SRC_DIR, "settings-actions.js"), "utf8");
+
+    // Group is mounted top-level in the General tab (not nested under HUD).
+    assert.ok(generalSource.includes("buildSessionCleanupGroup()"));
+    assert.ok(generalSource.includes('id: "general:session-cleanup"'));
+
+    // All three numeric prefs map to their own number input row.
+    assert.ok(generalSource.includes('key: "sessionStaleMs"'));
+    assert.ok(generalSource.includes('key: "workingStaleMs"'));
+    assert.ok(generalSource.includes('key: "detachedIdleStaleMs"'));
+    assert.ok(generalSource.includes("buildNumberInputRow"));
+    assert.ok(generalSource.includes("SESSION_CLEANUP_NUMBER_KEYS"));
+
+    // Reset button goes through the atomic command path.
+    assert.ok(generalSource.includes('"sessionCleanup.setTriple"'));
+    assert.ok(generalSource.includes("SESSION_CLEANUP_DEFAULTS"));
+    assert.ok(generalSource.includes('"actionResetSessionCleanup"'));
+
+    // patchInPlace covers the new keys in BOTH the existence guard and the sync loop.
+    assert.ok(generalSource.match(/SESSION_CLEANUP_NUMBER_KEYS\.has\(key\)[\s\S]+sessionCleanupControls\.get\(key\)\.syncFromSnapshot\(\)/));
+
+    // ui-core registers the helper and the mountedControls bag.
+    assert.ok(uiCoreSource.includes("buildNumberInputRow"));
+    assert.ok(uiCoreSource.includes("sessionCleanupControls: new Map()"));
+    assert.ok(uiCoreSource.includes("state.mountedControls.sessionCleanupControls.clear()"));
+
+    // The command is registered in settings-actions.
+    assert.ok(actionsSource.includes('"sessionCleanup.setTriple": setSessionCleanupTriple'));
+
+    // i18n keys present in all five languages.
+    for (const key of [
+      "rowSessionCleanupGroup",
+      "rowSessionCleanupGroupDesc",
+      "rowStaleSession",
+      "rowStaleSessionDesc",
+      "rowStaleWorking",
+      "rowStaleWorkingDesc",
+      "rowStaleDetached",
+      "rowStaleDetachedDesc",
+      "unitMinutes",
+      "unitSeconds",
+      "valueDisabled",
+      "actionResetSessionCleanup",
+    ]) {
+      const matches = i18nSource.match(new RegExp(`\\b${key}:`, "g"));
+      assert.ok(matches && matches.length >= 5, `${key} should appear in all 5 language tables (saw ${matches ? matches.length : 0})`);
+    }
+  });
+
   it("uses collapsible option lists for Session HUD and sound controls", () => {
     const generalSource = fs.readFileSync(path.join(SRC_DIR, "settings-tab-general.js"), "utf8");
     const css = fs.readFileSync(SETTINGS_CSS, "utf8");
@@ -1836,7 +2570,8 @@ describe("settings renderer browser environment", () => {
     assert.ok(!/key:\s*"soundMuted",[\s\S]{0,120}descKey:\s*"rowSoundDesc"/.test(generalSource));
     assert.ok(generalSource.includes('state.transientUiState.generalSwitches.set("soundMuted"'));
     assert.ok(generalSource.includes("if (!result || result.status !== \"ok\" || result.noop)"));
-    assert.ok(generalSource.includes("sessionHudSummaryAutoHide"));
+    assert.ok(generalSource.includes("sessionHudSummaryLabels"));
+    assert.ok(generalSource.includes('key: "sessionHudShowStateLabels"'));
     assert.ok(generalSource.includes("session-hud-summary-control"));
     assert.ok(/\.settings-option-list\s*\{[\s\S]*display:\s*grid;[\s\S]*gap:\s*8px;/.test(css));
     assert.ok(/\.settings-option-list \.settings-option-item\s*\{[\s\S]*background:\s*color-mix\(in srgb,\s*var\(--panel-bg\) 78%,\s*transparent\);/.test(css));
@@ -1846,9 +2581,11 @@ describe("settings renderer browser environment", () => {
     assert.ok(/\.bubble-policy-collapsible \.collapsible-group-summary\s*\{[^}]*flex:\s*0 0 auto;[^}]*flex-wrap:\s*nowrap;[^}]*max-width:\s*none;[^}]*\}/.test(css));
     assert.ok(!/\.session-hud-collapsible \.collapsible-group-summary\s*\{[^}]*flex-wrap:\s*nowrap;/.test(css));
     assert.ok(!/\.sound-collapsible \.collapsible-group-summary\s*\{[^}]*flex-wrap:\s*nowrap;/.test(css));
-    assert.ok(/\.session-hud-summary-control\s*\{[\s\S]*grid-template-columns:\s*repeat\(4,\s*max-content\);/.test(css));
+    assert.ok(/\.session-hud-summary-control\s*\{[\s\S]*grid-template-columns:\s*repeat\(3,\s*max-content\);/.test(css));
     assert.ok(/\.session-hud-summary-control\.compact\s*\{[\s\S]*display:\s*inline-flex;[\s\S]*width:\s*auto;/.test(css));
-    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.session-hud-summary-control\s*\{[\s\S]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);[\s\S]*width:\s*min\(238px,\s*42vw\);/.test(css));
+    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.session-hud-collapsible \.collapsible-group-header\s*\{[\s\S]*flex-wrap:\s*wrap;/.test(css));
+    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.session-hud-collapsible \.collapsible-group-summary\s*\{[\s\S]*flex:\s*0 0 calc\(100% - 22px\);[\s\S]*margin-left:\s*22px;/.test(css));
+    assert.ok(/@media \(max-width:\s*720px\)\s*\{[\s\S]*\.session-hud-summary-control\s*\{[\s\S]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);[\s\S]*width:\s*min\(238px,\s*100%\);/.test(css));
     assert.ok(/\.collapsible-group-text \.row-label\s*\{[\s\S]*text-overflow:\s*ellipsis;[\s\S]*white-space:\s*nowrap;/.test(css));
     assert.ok(/\.collapsible-group-text \.row-desc\s*\{[\s\S]*white-space:\s*normal;[\s\S]*-webkit-line-clamp:\s*2;/.test(css));
     assert.ok(/\.sound-summary-control\s*\{[\s\S]*display:\s*inline-flex;/.test(css));
@@ -1865,7 +2602,7 @@ describe("settings renderer browser environment", () => {
 
     const sections = generalHarness.content.querySelectorAll(".section");
     const sectionTitles = sections.map((section) => section.querySelector(".section-title").textContent);
-    assert.deepStrictEqual(sectionTitles, ["Appearance", "Startup", "Bubbles"]);
+    assert.deepStrictEqual(sectionTitles, ["Appearance", "Session management", "Startup", "Bubbles"]);
     assert.strictEqual(generalHarness.content.querySelector(".hardware-buddy-collapsible"), null);
 
     const remoteHarness = loadTelegramApprovalTabForTest({
@@ -1927,8 +2664,11 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(badge.querySelectorAll("span")[1].textContent, "hardwareBuddyStatus_secure");
     assert.ok(badge.classList.contains("tg-approval-badge-running"));
     assert.strictEqual(replyBadge.textContent, "hardwareBuddyRepliesOn");
+    assert.strictEqual(hardwareBuddy.querySelector(".hardware-buddy-repo-button"), null);
     assert.strictEqual(testButton.textContent, "hardwareBuddyTestButton");
     assert.strictEqual(hardwareBuddy.querySelector(".hardware-buddy-summary-control"), null);
+    assert.strictEqual(hardwareBuddy.querySelector(".hardware-buddy-quick-command-row"), null);
+    assert.strictEqual(hardwareBuddy.textContent.includes("hardwareBuddyQuickCommands"), false);
     assert.ok(/\.remote-approval-channel-card\.collapsible-group\s*\{[\s\S]*margin:\s*8px 0 14px;/.test(css));
     assert.ok(/\.tg-approval-channel-header\s*\{[\s\S]*justify-content:\s*space-between;/.test(css));
     assert.ok(/\.hardware-buddy-status-control\s*\{[\s\S]*display:\s*inline-flex;/.test(css));
@@ -2024,6 +2764,54 @@ describe("settings renderer browser environment", () => {
     desc = harness.content.querySelector(".hardware-buddy-test-row .row-desc");
     assert.strictEqual(harness.core.runtime.hardwareBuddyTest.result, null);
     assert.strictEqual(desc.textContent, "hardwareBuddyTestDisabled");
+  });
+
+  it("does not render Hardware Buddy Quick Command controls", () => {
+    const calls = [];
+    const harness = loadTelegramApprovalTabForTest({
+      snapshot: {
+        tgApproval: {
+          enabled: false,
+          allowedTgUserId: "123456789",
+          targetSessionKey: "telegram:123456789",
+        },
+        hardwareBuddy: {
+          enabled: false,
+          backend: "bleak",
+          address: "",
+          namePrefix: "Clawstick",
+          permissionsEnabled: false,
+          quickCommandsEnabled: true,
+        },
+      },
+      settingsAPI: {
+        getQuickCommandPresets: () => {
+          calls.push("presets");
+          return Promise.resolve({
+            enabled: true,
+            presets: [{ id: "plan_first", label: "先列计划" }],
+          });
+        },
+        sendQuickCommand: (payload) => {
+          calls.push(payload);
+          return Promise.resolve({ status: "ok", quickCommand: { id: payload.id } });
+        },
+      },
+    });
+    harness.core.runtime.quickCommandPresets = {
+      enabled: true,
+      presets: [
+        { id: "plan_first", label: "先列计划" },
+        { id: "show_diff", label: "show diff" },
+      ],
+    };
+    harness.render();
+
+    assert.strictEqual(harness.content.querySelector(".hardware-buddy-quick-command-row"), null);
+    assert.strictEqual(harness.content.querySelector(".hardware-buddy-quick-command-button"), null);
+    assert.strictEqual(harness.content.textContent.includes("hardwareBuddyQuickCommands"), false);
+    assert.strictEqual(harness.content.textContent.includes("先列计划"), false);
+    assert.strictEqual(calls.length, 0);
   });
 
   it("adds hover affordance to General size and volume sliders", () => {
@@ -2141,6 +2929,7 @@ describe("settings renderer browser environment", () => {
       lang: "en",
       size: 50,
       sessionHudEnabled: false,
+      sessionHudShowStateLabels: true,
       sessionHudShowElapsed: true,
       sessionHudCleanupDetached: true,
       soundMuted: false,
@@ -2169,11 +2958,13 @@ describe("settings renderer browser environment", () => {
     harness.renderContent();
 
     const master = harness.getSwitch("sessionHudEnabled");
+    const labels = harness.getSwitch("sessionHudShowStateLabels");
     const elapsed = harness.getSwitch("sessionHudShowElapsed");
     const cleanup = harness.getSwitch("sessionHudCleanupDetached");
     const summary = harness.core.state.mountedControls.sessionHudSummary.element;
     const optionList = harness.content.querySelector(".session-hud-option-list");
     assert.ok(master);
+    assert.ok(labels);
     assert.ok(elapsed);
     assert.ok(cleanup);
     assert.ok(optionList);
@@ -2182,6 +2973,9 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(summary.children.length, 1);
     assert.strictEqual(summary.children[0].textContent, "HUD: off");
     assert.strictEqual(summary.classList.contains("compact"), true);
+    assert.strictEqual(labels.classList.contains("disabled"), true);
+    assert.strictEqual(labels.attributes["aria-disabled"], "true");
+    assert.strictEqual(labels.tabIndex, -1);
     assert.strictEqual(elapsed.classList.contains("disabled"), true);
     assert.strictEqual(elapsed.attributes["aria-disabled"], "true");
     assert.strictEqual(elapsed.tabIndex, -1);
@@ -2198,21 +2992,24 @@ describe("settings renderer browser environment", () => {
       "Session HUD master broadcasts should patch mounted controls instead of rebuilding General"
     );
     assert.strictEqual(harness.getSwitch("sessionHudEnabled"), master);
+    assert.strictEqual(harness.getSwitch("sessionHudShowStateLabels"), labels);
     assert.strictEqual(harness.getSwitch("sessionHudShowElapsed"), elapsed);
     assert.strictEqual(harness.getSwitch("sessionHudCleanupDetached"), cleanup);
     assert.strictEqual(master.classList.contains("on"), true);
     assert.strictEqual(master.classList.contains("pending"), false);
+    assert.strictEqual(labels.classList.contains("disabled"), false);
+    assert.strictEqual(labels.attributes["aria-disabled"], undefined);
+    assert.strictEqual(labels.tabIndex, 0);
     assert.strictEqual(elapsed.classList.contains("disabled"), false);
     assert.strictEqual(elapsed.attributes["aria-disabled"], undefined);
     assert.strictEqual(elapsed.tabIndex, 0);
     assert.strictEqual(cleanup.classList.contains("disabled"), false);
     assert.strictEqual(cleanup.tabIndex, 0);
-    assert.strictEqual(summary.children.length, 4);
+    assert.strictEqual(summary.children.length, 3);
     assert.strictEqual(summary.classList.contains("compact"), false);
-    assert.strictEqual(summary.children[0].textContent, "HUD: on");
+    assert.strictEqual(summary.children[0].textContent, "Labels: on");
     assert.strictEqual(summary.children[1].textContent, "Time: on");
-    assert.strictEqual(summary.children[2].textContent, "Auto-hide: off");
-    assert.strictEqual(summary.children[3].textContent, "Auto-clear: on");
+    assert.strictEqual(summary.children[2].textContent, "Auto-clear: on");
 
     assert.ok(
       elapsed.eventListeners.click && elapsed.eventListeners.click.length > 0,
@@ -2419,6 +3216,7 @@ describe("settings renderer browser environment", () => {
       lang: "en",
       size: 50,
       sessionHudEnabled: true,
+      sessionHudShowStateLabels: true,
       sessionHudShowElapsed: true,
       sessionHudCleanupDetached: true,
       soundMuted: false,
@@ -2484,6 +3282,7 @@ describe("settings renderer browser environment", () => {
       lang: "en",
       size: 50,
       sessionHudEnabled: true,
+      sessionHudShowStateLabels: true,
       sessionHudShowElapsed: true,
       sessionHudCleanupDetached: true,
       soundMuted: false,
@@ -2545,11 +3344,14 @@ describe("settings renderer browser environment", () => {
     harness.renderContent();
 
     const master = harness.getSwitch("sessionHudEnabled");
+    const labels = harness.getSwitch("sessionHudShowStateLabels");
     const elapsed = harness.getSwitch("sessionHudShowElapsed");
     const cleanup = harness.getSwitch("sessionHudCleanupDetached");
     assert.ok(master);
+    assert.ok(labels);
     assert.ok(elapsed);
     assert.ok(cleanup);
+    assert.strictEqual(labels.classList.contains("disabled"), false);
     assert.strictEqual(elapsed.classList.contains("disabled"), false);
     assert.strictEqual(cleanup.classList.contains("disabled"), false);
 
@@ -2561,9 +3363,13 @@ describe("settings renderer browser environment", () => {
 
     assert.strictEqual(harness.getContentRenderCount(), beforeRenderCount);
     assert.strictEqual(harness.getSwitch("sessionHudEnabled"), master);
+    assert.strictEqual(harness.getSwitch("sessionHudShowStateLabels"), labels);
     assert.strictEqual(harness.getSwitch("sessionHudShowElapsed"), elapsed);
     assert.strictEqual(harness.getSwitch("sessionHudCleanupDetached"), cleanup);
     assert.strictEqual(master.classList.contains("on"), false);
+    assert.strictEqual(labels.classList.contains("disabled"), true);
+    assert.strictEqual(labels.attributes["aria-disabled"], "true");
+    assert.strictEqual(labels.tabIndex, -1);
     assert.strictEqual(elapsed.classList.contains("disabled"), true);
     assert.strictEqual(elapsed.attributes["aria-disabled"], "true");
     assert.strictEqual(elapsed.tabIndex, -1);
@@ -3085,6 +3891,67 @@ describe("settings renderer browser environment", () => {
     assert.strictEqual(permissionsSwitch.element.classList.contains("disabled"), true);
     assert.strictEqual(permissionsSwitch.element.attributes["aria-disabled"], "true");
     assert.strictEqual(permissionsSwitch.element.attributes.tabindex, "-1");
+  });
+
+  it("enables the Codex native sound switch only in Native permission mode", () => {
+    const harness = loadAgentsTabForTest({
+      snapshot: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "intercept",
+            nativeNotificationSoundEnabled: true,
+          },
+        },
+      },
+      agentMetadata: [{
+        id: "codex",
+        name: "Codex",
+        eventSource: "hook",
+        capabilities: {
+          permissionApproval: true,
+        },
+      }],
+      collapsedGroups: {
+        "agents:codex": false,
+      },
+    });
+
+    harness.core.ops.requestRender({ content: true });
+    harness.raf.flush();
+
+    const soundSwitch = [...harness.core.state.mountedControls.agentSwitches.values()]
+      .find((meta) => meta.agentId === "codex" && meta.flag === "nativeNotificationSoundEnabled");
+    assert.ok(soundSwitch, "Codex native sound switch should be mounted");
+    assert.strictEqual(soundSwitch.element.classList.contains("disabled"), true);
+
+    harness.core.ops.applyChanges({
+      changes: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "native",
+            nativeNotificationSoundEnabled: true,
+          },
+        },
+      },
+      snapshot: {
+        agents: {
+          codex: {
+            enabled: true,
+            permissionsEnabled: true,
+            permissionMode: "native",
+            nativeNotificationSoundEnabled: true,
+          },
+        },
+      },
+    });
+
+    assert.strictEqual(soundSwitch.element.classList.contains("disabled"), false);
+    assert.strictEqual(soundSwitch.element.attributes["aria-disabled"], "false");
+    assert.strictEqual(soundSwitch.element.attributes.tabindex, "0");
   });
 
   it("slides the Codex permission mode pill when mode broadcasts patch in place", () => {

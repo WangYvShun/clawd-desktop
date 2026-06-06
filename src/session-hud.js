@@ -11,8 +11,11 @@ const isWin = process.platform === "win32";
 const HUD_BORDER_Y = 2;
 const HUD_WIDTH = 240;
 const HUD_WIDTH_COMPACT = 190;
+const HUD_WIDTH_LABELS = 320;
+const HUD_WIDTH_LABELS_COMPACT = 260;
 const HUD_ROW_HEIGHT = 28;
 const HUD_MAX_EXPANDED_ROWS = 3;
+const HUD_MAX_EXPANDED_ROWS_LABELS = 5;
 const HUD_HEIGHT = HUD_ROW_HEIGHT + HUD_BORDER_Y;
 const HUD_WINDOW_SHELL = Object.freeze({
   top: 2,
@@ -107,8 +110,8 @@ function pointInHotZone(point, hotZone) {
 function evaluateShouldShow({
   snapshot,
   sessionHudEnabled,
-  sessionHudAutoHide,
   sessionHudPinned,
+  clickRevealed,
   inHotZone,
   now,
   visibleHoldUntil,
@@ -125,9 +128,10 @@ function evaluateShouldShow({
     miniTransitioning,
   });
   if (!baseEligible) return { show: false, nextHoldUntil: 0 };
-  if (sessionHudAutoHide !== true) return { show: true, nextHoldUntil: 0 };
   if (sessionHudPinned === true) return { show: true, nextHoldUntil: 0 };
+  if (clickRevealed !== true) return { show: false, nextHoldUntil: 0 };
 
+  // revealed 态：hot zone 续命 + grace period
   let nextHoldUntil = Number.isFinite(visibleHoldUntil) ? visibleHoldUntil : 0;
   const tNow = Number.isFinite(now) ? now : 0;
   const grace = Number.isFinite(hideGraceMs) ? hideGraceMs : 0;
@@ -138,7 +142,11 @@ function evaluateShouldShow({
   return { show, nextHoldUntil };
 }
 
-function computeHudLayout(snapshot) {
+function getHudMaxExpandedRows(showStateLabels = true) {
+  return showStateLabels === false ? HUD_MAX_EXPANDED_ROWS : HUD_MAX_EXPANDED_ROWS_LABELS;
+}
+
+function computeHudLayout(snapshot, options = {}) {
   const sessions = (snapshot && Array.isArray(snapshot.sessions)) ? snapshot.sessions : [];
   if (sessions.length === 0) return { expanded: [], folded: [], rowCount: 0 };
   const byId = new Map(sessions.map((s) => [s.id, s]));
@@ -149,8 +157,9 @@ function computeHudLayout(snapshot) {
   const orderedSet = new Set(ordered.map((s) => s.id));
   const missing = sessions.filter((s) => !orderedSet.has(s.id));
   const visible = ordered.concat(missing).filter(isHudSession);
-  const expanded = visible.slice(0, HUD_MAX_EXPANDED_ROWS);
-  const folded = visible.slice(HUD_MAX_EXPANDED_ROWS);
+  const maxExpandedRows = getHudMaxExpandedRows(options.showStateLabels);
+  const expanded = visible.slice(0, maxExpandedRows);
+  const folded = visible.slice(maxExpandedRows);
   const rowCount = expanded.length + (folded.length > 0 ? 1 : 0);
   return { expanded, folded, rowCount };
 }
@@ -215,8 +224,9 @@ function computeSessionHudBounds({ hitRect, anchorRect, workArea, width = HUD_WI
   };
 }
 
-function getHudWidth(showElapsed = true) {
-  return showElapsed === false ? HUD_WIDTH_COMPACT : HUD_WIDTH;
+function getHudWidth(showElapsed = true, showStateLabels = true) {
+  if (showStateLabels === false) return showElapsed === false ? HUD_WIDTH_COMPACT : HUD_WIDTH;
+  return showElapsed === false ? HUD_WIDTH_LABELS_COMPACT : HUD_WIDTH_LABELS;
 }
 
 function deferMacFloatingVisibility(ctx, win) {
@@ -240,7 +250,7 @@ module.exports = function initSessionHud(ctx) {
   let lastReservedOffset = 0;
   let lastHudHeight = HUD_ROW_HEIGHT;
   let pollTimer = null;
-  let autoHideRevealed = false;
+  let clickRevealed = false;
   let visibleHoldUntil = 0;
 
   function getCurrentSnapshot() {
@@ -269,16 +279,14 @@ module.exports = function initSessionHud(ctx) {
 
   function shouldShow(snapshot = latestSnapshot) {
     if (!baseEligible(snapshot)) return false;
-    if (ctx.sessionHudAutoHide !== true) return true;
     if (ctx.sessionHudPinned === true) return true;
-    return autoHideRevealed;
+    return clickRevealed;
   }
 
   function isAutoHidePollingNeeded() {
     if (!baseEligible(latestSnapshot)) return false;
-    if (ctx.sessionHudAutoHide !== true) return false;
     if (ctx.sessionHudPinned === true) return false;
-    return true;
+    return clickRevealed === true;
   }
 
   function computeExpectedHudContentBounds(snapshot) {
@@ -296,9 +304,9 @@ module.exports = function initSessionHud(ctx) {
     const workArea = typeof ctx.getNearestWorkArea === "function"
       ? ctx.getNearestWorkArea(cx, cy)
       : { x: 0, y: 0, width: 1280, height: 800 };
-    const layout = computeHudLayout(snapshot);
+    const layout = computeHudLayout(snapshot, { showStateLabels: ctx.sessionHudShowStateLabels !== false });
     const height = computeHudHeight(layout.rowCount);
-    const width = getHudWidth(ctx.sessionHudShowElapsed !== false);
+    const width = getHudWidth(ctx.sessionHudShowElapsed !== false, ctx.sessionHudShowStateLabels !== false);
     const computed = computeSessionHudBounds({ hitRect, anchorRect, workArea, width, height });
     return { hitRect, contentBounds: computed && computed.contentBounds };
   }
@@ -328,8 +336,8 @@ module.exports = function initSessionHud(ctx) {
     const result = evaluateShouldShow({
       snapshot: latestSnapshot,
       sessionHudEnabled: ctx.sessionHudEnabled,
-      sessionHudAutoHide: ctx.sessionHudAutoHide,
       sessionHudPinned: ctx.sessionHudPinned,
+      clickRevealed,
       inHotZone,
       now,
       visibleHoldUntil,
@@ -339,10 +347,14 @@ module.exports = function initSessionHud(ctx) {
       miniTransitioning: getMiniTransitioning(),
     });
     visibleHoldUntil = result.nextHoldUntil;
-    if (result.show !== autoHideRevealed) {
-      autoHideRevealed = result.show;
+    // In revealed state, poll detecting !show means user moved away past grace.
+    // Clear clickRevealed so subsequent ticks stop polling.
+    const wasRevealed = clickRevealed;
+    if (wasRevealed && !result.show && ctx.sessionHudPinned !== true) {
+      clickRevealed = false;
+      visibleHoldUntil = 0;
       if (syncOnChange) {
-        syncSessionHud(latestSnapshot, { sendSnapshot: result.show });
+        syncSessionHud(latestSnapshot, { sendSnapshot: false });
       }
       return true;
     }
@@ -375,8 +387,61 @@ module.exports = function initSessionHud(ctx) {
       clearTimeout(pollTimer);
       pollTimer = null;
     }
-    autoHideRevealed = false;
+    clickRevealed = false;
     visibleHoldUntil = 0;
+  }
+
+  // Internal: clear revealed state without syncing. Caller decides next sync.
+  function clearReveal() {
+    clickRevealed = false;
+    visibleHoldUntil = 0;
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  // Public API: user clicked the pet to reveal HUD.
+  function revealFromPet() {
+    if (!baseEligible(latestSnapshot)) return;
+    if (ctx.sessionHudPinned === true) return;     // pinned already always-show
+    if (clickRevealed) {
+      // Already revealed — refresh grace as a click tolerance.
+      visibleHoldUntil = Date.now() + HIDE_GRACE_MS;
+      return;
+    }
+    clickRevealed = true;
+    visibleHoldUntil = Date.now() + HIDE_GRACE_MS;  // seed
+    syncSessionHud(latestSnapshot, { sendSnapshot: true });
+    startAutoHidePoll();
+  }
+
+  // Public API: settings effect router calls this when sessionHudPinned flips.
+  // Router has already updated ctx.sessionHudPinned before calling.
+  function handlePinnedChanged(next) {
+    if (next === true) {
+      stopAutoHidePoll();
+      // Pinned now — HUD always shows via shouldShow. Clear any stale reveal.
+      clickRevealed = false;
+      visibleHoldUntil = 0;
+      syncSessionHud(latestSnapshot);
+      return;
+    }
+    // unpin transition — read real window state, NOT shouldShow() (router
+    // already mirrored sessionHudPinned=false so shouldShow would return
+    // false and cause the HUD to flash hidden).
+    const wasVisible =
+      hudWindow && !hudWindow.isDestroyed() && hudWindow.isVisible();
+    if (wasVisible && baseEligible(latestSnapshot)) {
+      // Seed revealed state so the HUD stays visible until the user moves
+      // away (grace period), preserving the on-screen experience.
+      clickRevealed = true;
+      visibleHoldUntil = Date.now() + HIDE_GRACE_MS;
+      startAutoHidePoll();
+      syncSessionHud(latestSnapshot);
+    } else {
+      syncSessionHud(latestSnapshot);
+    }
   }
 
   function syncAutoHidePollLifecycle() {
@@ -389,8 +454,8 @@ module.exports = function initSessionHud(ctx) {
     if (!hudWindow.webContents || hudWindow.webContents.isDestroyed()) return;
     hudWindow.webContents.send("session-hud:session-snapshot", {
       ...snapshot,
+      hudShowStateLabels: ctx.sessionHudShowStateLabels !== false,
       hudShowElapsed: ctx.sessionHudShowElapsed !== false,
-      hudAutoHide: ctx.sessionHudAutoHide === true,
       hudPinned: ctx.sessionHudPinned === true,
     });
   }
@@ -408,7 +473,7 @@ module.exports = function initSessionHud(ctx) {
 
     didFinishLoad = false;
     hudFlippedAbove = false;
-    const hudWidth = getHudWidth(ctx.sessionHudShowElapsed !== false);
+    const hudWidth = getHudWidth(ctx.sessionHudShowElapsed !== false, ctx.sessionHudShowStateLabels !== false);
     hudWindow = new BrowserWindow({
       parent: ctx.win,
       width: hudWidth + HUD_WINDOW_SHELL.left + HUD_WINDOW_SHELL.right,
@@ -475,9 +540,9 @@ module.exports = function initSessionHud(ctx) {
     const workArea = typeof ctx.getNearestWorkArea === "function"
       ? ctx.getNearestWorkArea(cx, cy)
       : { x: 0, y: 0, width: 1280, height: 800 };
-    const layout = computeHudLayout(snapshot);
+    const layout = computeHudLayout(snapshot, { showStateLabels: ctx.sessionHudShowStateLabels !== false });
     const height = computeHudHeight(layout.rowCount);
-    const width = getHudWidth(ctx.sessionHudShowElapsed !== false);
+    const width = getHudWidth(ctx.sessionHudShowElapsed !== false, ctx.sessionHudShowStateLabels !== false);
     lastHudHeight = height;
     return computeSessionHudBounds({ hitRect, anchorRect, workArea, width, height });
   }
@@ -495,6 +560,12 @@ module.exports = function initSessionHud(ctx) {
 
   function syncSessionHud(snapshot = latestSnapshot || getCurrentSnapshot(), options = {}) {
     latestSnapshot = snapshot;
+    // Defend against stale reveal: if base eligibility dropped (e.g. last
+    // session ended), clear any leftover clickRevealed so a future new
+    // session does not pop the HUD without a fresh user click.
+    if (!baseEligible(snapshot)) {
+      clearReveal();
+    }
     syncAutoHidePollLifecycle();
     if (!shouldShow(snapshot)) {
       hideSessionHud();
@@ -559,12 +630,17 @@ module.exports = function initSessionHud(ctx) {
     getHudReservedOffset,
     cleanup,
     getWindow: () => hudWindow,
+    // v5 three-state API
+    revealFromPet,
+    handlePinnedChanged,
+    clearReveal,
   };
 };
 
 module.exports.__test = {
   computeSessionHudBounds,
   computeHudLayout,
+  getHudMaxExpandedRows,
   computeHudHeight,
   computeHudReservedOffset,
   isHudSession,
@@ -577,9 +653,12 @@ module.exports.__test = {
   constants: {
     HUD_WIDTH,
     HUD_WIDTH_COMPACT,
+    HUD_WIDTH_LABELS,
+    HUD_WIDTH_LABELS_COMPACT,
     HUD_HEIGHT,
     HUD_ROW_HEIGHT,
     HUD_MAX_EXPANDED_ROWS,
+    HUD_MAX_EXPANDED_ROWS_LABELS,
     HUD_WINDOW_SHELL,
     HUD_PET_GAP,
     BUBBLE_GAP,
